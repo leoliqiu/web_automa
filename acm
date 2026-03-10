@@ -1,0 +1,313 @@
+import pandas as pd
+from typing import Dict, List, Set, Optional, Any
+import warnings
+import datetime
+
+
+class AccessControlManager:
+    """
+    Manages access control permissions for dataset fields.
+    Defines whether fields are updatable, hidden, or view-only for users.
+    """
+
+    # Permission constants
+    PERMISSION_UPDATABLE = "updatable"
+    PERMISSION_HIDDEN = "hidden"
+    PERMISSION_VIEW_ONLY = "view_only"
+
+    def __init__(self, dataset_columns: Optional[List[str]] = None, name: str = "acm"):
+        """
+        Initialize the Access Control Manager.
+
+        Args:
+            dataset_columns: List of column names from the dataset (optional)
+            name: Identifier name for this ACM instance
+        """
+        self.permissions: Dict[str, Dict[str, str]] = {}
+        self.conditional_permissions: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+        self.dataset_columns = set(dataset_columns) if dataset_columns else set()
+        self.user_roles: Set[str] = set()
+        self.name = name
+        self.date = datetime.datetime.now().strftime("%Y%m%d")
+
+    def _valid_permissions(self) -> Set[str]:
+        """Return the supported permission names."""
+        return {self.PERMISSION_UPDATABLE, self.PERMISSION_HIDDEN, self.PERMISSION_VIEW_ONLY}
+
+    def set_permission(self, field_name: str, role: str, permission: str) -> None:
+        """
+        Set one normalized permission entry for a field/role pair.
+
+        Args:
+            field_name: Name of the field to protect
+            role: Role name
+            permission: Permission value for this field/role pair
+        """
+        if permission not in self._valid_permissions():
+            raise ValueError(f"Invalid permission '{permission}'. Must be one of: {self._valid_permissions()}")
+
+        if role not in self.user_roles:
+            warnings.warn(f"Role '{role}' not defined. Adding it to available roles.")
+            self.user_roles.add(role)
+
+        if self.dataset_columns and field_name not in self.dataset_columns:
+            warnings.warn(f"Field '{field_name}' is not in the dataset columns. "
+                          f"Available columns: {list(self.dataset_columns)}")
+
+        if field_name not in self.permissions:
+            self.permissions[field_name] = {}
+
+        self.permissions[field_name][role] = permission
+
+    def set_dataset_columns(self, columns: List[str]) -> None:
+        """
+        Set the dataset columns to validate against.
+
+        Args:
+            columns: List of column names from the dataset
+        """
+        self.dataset_columns = set(columns)
+
+    def add_role(self, role_name: str) -> None:
+        """
+        Add a user role to the access control system.
+
+        Args:
+            role_name: Name of the role to add
+        """
+        self.user_roles.add(role_name)
+
+    def define_permissions(self, field_name: str, permissions: Dict[str, List[str]]) -> None:
+        """
+        Define permissions for a specific field.
+
+        Args:
+            field_name: Name of the field to set permissions for
+            permissions: Dictionary mapping permissions to roles
+                        Example: {"updatable": ["admin", "editor"], "hidden": ["guest"]}
+
+        Raises:
+            ValueError: If field_name is not in dataset columns
+        """
+        valid_permissions = self._valid_permissions()
+        for permission in permissions.keys():
+            if permission not in valid_permissions:
+                raise ValueError(f"Invalid permission '{permission}'. "
+                                 f"Must be one of: {valid_permissions}")
+
+        normalized_permissions: Dict[str, str] = {}
+        for permission, roles in permissions.items():
+            for role in roles:
+                if role in normalized_permissions and normalized_permissions[role] != permission:
+                    raise ValueError(
+                        f"Conflicting permissions for field '{field_name}' and role '{role}': "
+                        f"'{normalized_permissions[role]}' vs '{permission}'"
+                    )
+                normalized_permissions[role] = permission
+
+        self.permissions[field_name] = {}
+        for role, permission in normalized_permissions.items():
+            self.set_permission(field_name, role, permission)
+
+    def define_conditional_permission(self, field_name: str, role: str, condition: str, permission: str) -> None:
+        """
+        Define a record-level permission override for one field/role pair.
+
+        Args:
+            field_name: Name of the field to protect
+            role: Role name
+            condition: Row-level condition string
+            permission: Permission to apply when the condition matches
+        """
+        if permission not in self._valid_permissions():
+            raise ValueError(f"Invalid permission '{permission}'. Must be one of: {self._valid_permissions()}")
+        if role not in self.user_roles:
+            warnings.warn(f"Role '{role}' not defined. Adding it to available roles.")
+            self.user_roles.add(role)
+        self.conditional_permissions.setdefault(field_name, {}).setdefault(role, []).append({
+            "condition": condition,
+            "permission": permission,
+        })
+
+    def get_permissions(self, field_name: str, role: str, record: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Get the permission for a specific field and role.
+
+        Args:
+            field_name: Name of the field
+            role: User role to check permissions for
+
+        Returns:
+            str: Permission type for the field and role
+
+        Raises:
+            ValueError: If field_name or role is not defined
+        """
+        if field_name not in self.permissions:
+            raise ValueError(f"Field '{field_name}' has no permissions defined")
+
+        if role not in self.user_roles:
+            raise ValueError(f"Role '{role}' is not defined")
+
+        if record is not None:
+            for rule in self.conditional_permissions.get(field_name, {}).get(role, []):
+                try:
+                    if self._evaluate_record_condition(rule["condition"], record):
+                        return rule["permission"]
+                except Exception:
+                    continue
+
+        return self.permissions[field_name].get(role, self.PERMISSION_UPDATABLE)
+
+    def _evaluate_record_condition(self, condition: str, record: Dict[str, Any]) -> bool:
+        """Evaluate a simple row-level ACM condition."""
+        from data_set_creator_and_generator import DatasetGenerator
+        evaluator = DatasetGenerator({}, {key: [value] for key, value in record.items() if value is not None})
+        return evaluator.evaluate_condition(condition, record)
+
+    def can_access(self, field_name: str, role: str, record: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Check if a role can access a field.
+
+        Args:
+            field_name: Name of the field
+            role: User role to check access for
+
+        Returns:
+            bool: True if the role can access the field, False otherwise
+        """
+        try:
+            permission = self.get_permissions(field_name, role, record=record)
+            return permission != self.PERMISSION_HIDDEN
+        except ValueError:
+            # If field or role not defined, default to allowing access
+            return True
+
+    def can_update(self, field_name: str, role: str, record: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Check if a role can update a field.
+
+        Args:
+            field_name: Name of the field
+            role: User role to check update permissions for
+
+        Returns:
+            bool: True if the role can update the field, False otherwise
+        """
+        try:
+            permission = self.get_permissions(field_name, role, record=record)
+            return permission == self.PERMISSION_UPDATABLE
+        except ValueError:
+            # If field or role not defined, default to allowing updates
+            return True
+
+    def generate_permissions_report(self, role: Optional[str] = None) -> pd.DataFrame:
+        """
+        Generate a report of permissions for all fields.
+
+        Args:
+            role: Specific role to filter by (optional)
+
+        Returns:
+            pd.DataFrame: Report of permissions
+        """
+        report_data = []
+
+        for field in self.permissions.keys():
+            if role:
+                try:
+                    permission = self.get_permissions(field, role)
+                    report_data.append({"field": field, "role": role, "permission": permission})
+                except ValueError:
+                    continue
+            else:
+                for field_role, permission in self.permissions[field].items():
+                    report_data.append({"field": field, "role": field_role, "permission": permission})
+        for field, role_rules in self.conditional_permissions.items():
+            for role_name, rules in role_rules.items():
+                for rule in rules:
+                    if role is None or role == role_name:
+                        report_data.append({
+                            "field": field,
+                            "role": role_name,
+                            "permission": rule["permission"],
+                            "condition": rule["condition"],
+                        })
+
+        return pd.DataFrame(report_data)
+
+    def validate_permissions(self) -> List[str]:
+        """
+        Validate that all permissions reference existing dataset columns.
+
+        Returns:
+            List[str]: List of warnings about undefined fields
+        """
+        warnings = []
+        for field in self.permissions.keys():
+            if field not in self.dataset_columns:
+                warnings.append(f"Field '{field}' has permissions defined but is not in the dataset")
+        for field in self.conditional_permissions.keys():
+            if field not in self.dataset_columns:
+                warnings.append(f"Field '{field}' has conditional permissions defined but is not in the dataset")
+
+        return warnings
+
+    def apply_permissions_to_dataset(self, df: pd.DataFrame, role: str) -> pd.DataFrame:
+        """
+        Apply permissions to a dataset for a specific role.
+        This creates a new DataFrame with access control applied.
+
+        Args:
+            df: Input DataFrame
+            role: User role to apply permissions for
+
+        Returns:
+            pd.DataFrame: DataFrame with permissions applied
+        """
+        result_df = df.copy()
+
+        columns_to_drop = set()
+        for index, row in df.iterrows():
+            record = row.to_dict()
+            for column in list(result_df.columns):
+                if column in columns_to_drop:
+                    continue
+                if not self.can_access(column, role, record=record):
+                    columns_to_drop.add(column)
+        if columns_to_drop:
+            result_df = result_df.drop(columns=list(columns_to_drop))
+
+        return result_df
+
+    def save_permissions(self, filename: Optional[str] = None) -> str:
+        """
+        Save permissions to a CSV file.
+
+        Args:
+            filename: Name of the file to save to (optional)
+
+        Returns:
+            str: Path to the saved file
+        """
+        if filename is None:
+            filename = f"permissions_{self.name}_{self.date}.csv"
+
+        report = self.generate_permissions_report()
+        report.to_csv(filename, index=False)
+        return filename
+
+    def load_permissions(self, filename: str) -> None:
+        """
+        Load permissions from a CSV file.
+
+        Args:
+            filename: Name of the file to load from
+        """
+        df = pd.read_csv(filename)
+
+        for _, row in df.iterrows():
+            field = row['field']
+            role = row['role']
+            permission = row['permission']
+            self.set_permission(field, role, permission)
