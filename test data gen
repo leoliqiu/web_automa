@@ -1,1 +1,1278 @@
+"""
+Test-Case Guide
+===============
 
+This file is organized as runnable examples of the main features in
+`DataSetCreator` and `AccessControlManager`.
+
+How to read the examples:
+- Examples 1-6: core logic and ACM integration behavior
+- Examples 7-18: question setup, dependencies, grouping, role filtering, and dataset generation
+- Examples 19-21: deterministic behavior and failure cases
+- Examples 22-27: profiles, coverage, pairwise generation, conditional ACM, exports, and UI payload filtering
+
+What each example demonstrates:
+- Example 1: logic rules cannot reference undefined questions
+- Example 2: nested bracketed conditions work across multiple derived fields
+- Example 3: chained email reminder calculations work on generated data
+- Example 4: role-style business permissions can be modeled as generated fields
+- Example 5: calculated questionnaire outputs remain internally consistent
+- Example 6: ACM metadata export works alongside generated datasets
+- Example 7: base questions generate allowed answer values
+- Example 8: dependency conditions convert blocked rows to `SKIP`
+- Example 9: `if_conditions` use `default_value` when no match is found
+- Example 10: simple numeric logic rules produce expected outputs
+- Example 11: complex boolean logic rules with brackets evaluate correctly
+- Example 12: explicit `skip=True` produces `SKIP` for the whole question
+- Example 13: `copy_from` mirrors another field value
+- Example 14: grouped questions cover all combinations in the group
+- Example 15: pre-generator metadata export writes configuration to CSV
+- Example 16: multiple generation features work together in one dataset
+- Example 17: dependency checks run before conditional answer mapping
+- Example 18: role-specific ACM exports hide restricted columns
+- Example 19: using the same seed produces the same dataset
+- Example 20: malformed conditions are rejected early
+- Example 21: conflicting ACM permissions are rejected early
+- Example 22: dataset profiles can be saved and loaded
+- Example 23: coverage reporting shows observed answers and logic usage
+- Example 24: pairwise generation covers value pairs across marked questions
+- Example 25: record-level ACM rules can override field visibility
+- Example 26: validation and Excel export work as expected
+- Example 27: filtered CSV output can be converted into a UI-ready dictionary
+
+Running this file:
+- It clears `data_set_cg_test` before running
+- It prints a short explanation before each example
+- It reports `PASS` or `FAIL` per example and exits non-zero if any test fails
+"""
+
+import sys
+import traceback
+import json
+from datetime import datetime
+from pathlib import Path
+import shutil
+
+import pandas as pd
+
+CURRENT_DIR = Path(__file__).resolve().parent
+TEST_OUTPUT_DIR = CURRENT_DIR / "data_set_cg_test"
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+from access_control_manager import AccessControlManager
+from data_set_creator_and_generator import DataSetCreator, ConditionBuilder
+
+
+def test_base_questions(tmp_path):
+    """Example 7: base questions without dependencies generate values from their allowed answer sets."""
+    creator = DataSetCreator()
+    creator.add_question("q1", ["Yes", "No"], default_value="Yes")
+    creator.add_question("q2", ["High", "Medium", "Low"], default_value="Medium")
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "test_base_questions.csv"))
+
+    assert set(dataset.columns) == {"q1", "q2"}
+    assert set(dataset["q1"].unique()).issubset({"Yes", "No"})
+    assert set(dataset["q2"].unique()).issubset({"High", "Medium", "Low"})
+
+
+def test_dependency_questions(tmp_path):
+    """Example 8: dependency rules force dependent questions to become SKIP when the condition is false."""
+    creator = DataSetCreator()
+    creator.add_question("q1", ["Yes", "No"])
+    creator.add_question("q2", ["High", "Low"], dependency="q1 == 'Yes'")
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "test_dependency_questions.csv"))
+
+    for _, row in dataset.iterrows():
+        if row["q1"] == "Yes":
+            assert row["q2"] in ["High", "Low"]
+        else:
+            assert row["q2"] == "SKIP"
+
+
+def test_if_conditions_default_value(tmp_path):
+    """Example 9: if_conditions fall back to default_value when no earlier condition matches."""
+    creator = DataSetCreator()
+    creator.add_question("q1", ["A", "B", "C"])
+    creator.add_question(
+        "q2",
+        if_conditions=[
+            {"q1 == 'A'": "X"},
+            {"q1 == 'B'": "Y"},
+            {"default_value": "Z"},
+        ],
+    )
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "test_if_conditions_default.csv"))
+
+    for _, row in dataset.iterrows():
+        if row["q1"] == "A":
+            assert row["q2"] == "X"
+        elif row["q1"] == "B":
+            assert row["q2"] == "Y"
+        else:
+            assert row["q2"] == "Z"
+
+
+def test_add_logic_basic(tmp_path):
+    """Example 10: simple add_logic rules assign output values based on one numeric input."""
+    creator = DataSetCreator()
+    creator.add_question("age", [18, 25, 65])
+    creator.add_logic(
+        "discount",
+        rules=[
+            {"age < 18": "10%"},
+            {"age >= 65": "20%"},
+            {"default_value": "0%"},
+        ],
+    )
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "test_add_logic_basic.csv"))
+
+    for _, row in dataset.iterrows():
+        if row["age"] < 18:
+            assert row["discount"] == "10%"
+        elif row["age"] >= 65:
+            assert row["discount"] == "20%"
+        else:
+            assert row["discount"] == "0%"
+
+
+def test_add_logic_complex(tmp_path):
+    """Example 11: bracketed boolean expressions apply the correct branch in logic rules."""
+    creator = DataSetCreator()
+    creator.add_question("age", [16, 25, 70])
+    creator.add_question("member", [True, False])
+    creator.add_logic(
+        "offer",
+        rules=[
+            {"(age < 18 OR age >= 65) AND member == True": "Special"},
+            {"default_value": "Regular"},
+        ],
+    )
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "test_add_logic_complex.csv"))
+
+    for _, row in dataset.iterrows():
+        if (row["age"] < 18 or row["age"] >= 65) and row["member"]:
+            assert row["offer"] == "Special"
+        else:
+            assert row["offer"] == "Regular"
+
+
+def test_skip_logic(tmp_path):
+    """Example 12: skip-enabled questions are filled with SKIP in every generated row."""
+    creator = DataSetCreator()
+    creator.add_question("q1", ["Yes", "No"])
+    creator.add_question("q2", ["A", "B"], skip=True)
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "test_skip_logic.csv"))
+
+    assert (dataset["q2"] == "SKIP").all()
+
+
+def test_copy_logic(tmp_path):
+    """Example 13: copy_from duplicates the source question value into the target question."""
+    creator = DataSetCreator()
+    creator.add_question("source", ["X", "Y"])
+    creator.add_question("copy", ["X", "Y"], copy_from="source")
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "test_copy_logic.csv"))
+
+    for _, row in dataset.iterrows():
+        assert row["copy"] == row["source"]
+
+
+def test_grouped_questions(tmp_path):
+    """Example 14: grouped questions generate the full set of combinations within the same group."""
+    creator = DataSetCreator()
+    creator.add_question("color", ["Red", "Blue"], group="style")
+    creator.add_question("size", ["S", "L"], group="style")
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "test_grouped_questions.csv"))
+
+    expected_combinations = {
+        ("Red", "S"), ("Red", "L"),
+        ("Blue", "S"), ("Blue", "L"),
+    }
+    actual_combinations = set(zip(dataset["color"], dataset["size"]))
+    assert actual_combinations == expected_combinations
+
+
+def test_pre_generator_data(tmp_path):
+    """Example 15: pre-generator export writes question metadata to a CSV file."""
+    creator = DataSetCreator()
+    creator.add_question("q1", ["Yes", "No"])
+    creator.add_question("q2", ["A", "B"], dependency="q1 == 'Yes'")
+
+    output_file = tmp_path / "test_pre_generator_data.csv"
+    creator.export_pre_generator_data(str(output_file))
+
+    assert output_file.exists()
+    df = pd.read_csv(output_file)
+    assert set(df["Key"]) == {"q1", "q2"}
+
+
+def test_all_features_combined(tmp_path):
+    """Example 16: base questions, logic, grouping, and skip behavior work together in one dataset."""
+    creator = DataSetCreator()
+    creator.add_question("age", [15, 25, 70])
+    creator.add_question("member", [True, False])
+    creator.add_question(
+        "status",
+        if_conditions=[
+            {"age < 18": "Junior"},
+            {"age >= 65": "Senior"},
+            {"default_value": "Adult"},
+        ],
+    )
+    creator.add_logic(
+        "discount",
+        rules=[
+            {"status == 'Junior'": "50%"},
+            {"status == 'Senior' AND member == True": "30%"},
+            {"default_value": "0%"},
+        ],
+    )
+    creator.add_question("color", ["Red", "Blue"], group="prefs")
+    creator.add_question("size", ["S", "L"], group="prefs")
+    creator.add_question("notes", ["Text"], skip=True)
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "test_all_features.csv"))
+
+    for _, row in dataset.iterrows():
+        if row["age"] < 18:
+            assert row["status"] == "Junior"
+        elif row["age"] >= 65:
+            assert row["status"] == "Senior"
+        else:
+            assert row["status"] == "Adult"
+
+        if row["status"] == "Junior":
+            assert row["discount"] == "50%"
+        elif row["status"] == "Senior" and row["member"]:
+            assert row["discount"] == "30%"
+        else:
+            assert row["discount"] == "0%"
+
+        assert row["color"] in ["Red", "Blue"]
+        assert row["size"] in ["S", "L"]
+        assert row["notes"] == "SKIP"
+
+
+def test_dependency_with_if_condition(tmp_path):
+    """Example 17: dependency checks run before if_conditions so skipped rows stay skipped."""
+    creator = DataSetCreator()
+    creator.logging = True
+    creator.add_question("q1", ["Yes", "No", "Maybe"])
+    creator.add_question(
+        "q2",
+        possible_answers=["Option1", "Option2", "Option3"],
+        default_value="Option3",
+        dependency="q1 != 'Maybe'",
+        if_conditions=[
+            {"q1 == 'Yes'": "Option1"},
+            {"q1 == 'No'": "Option2"},
+        ],
+    )
+
+    test_data = [
+        {"q1": "Yes", "expected": "Option1"},
+        {"q1": "No", "expected": "Option2"},
+        {"q1": "Maybe", "expected": "SKIP"},
+        {"q1": "Yes", "expected": "Option1"},
+        {"q1": "No", "expected": "Option2"},
+    ]
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "test_dependency_with_if.csv"))
+
+    for test_case in test_data:
+        q1_val = test_case["q1"]
+        expected = test_case["expected"]
+        matches = dataset[dataset["q1"] == q1_val]
+        assert len(matches) > 0, f"No rows with q1={q1_val} found"
+        for _, row in matches.iterrows():
+            assert row["q2"] == expected, f"For q1={q1_val}, expected q2={expected}, got {row['q2']}"
+
+
+def test_role_specific_acm_export(tmp_path):
+    """Example 18: role-specific ACM export hides restricted columns while keeping visible ones."""
+    creator = DataSetCreator()
+    creator.add_question("employee_id", [101, 102])
+    creator.add_question("department", ["HR", "IT"])
+    creator.add_question("salary_band", ["A", "B"])
+    creator.add_question("manager_note", ["review", "approved"])
+
+    acm = AccessControlManager(name="role_export_acm")
+    for role in ["admin", "viewer", "guest"]:
+        acm.add_role(role)
+
+    acm.define_permissions("employee_id", {
+        AccessControlManager.PERMISSION_UPDATABLE: ["admin"],
+        AccessControlManager.PERMISSION_VIEW_ONLY: ["viewer", "guest"],
+    })
+    acm.define_permissions("department", {
+        AccessControlManager.PERMISSION_UPDATABLE: ["admin"],
+        AccessControlManager.PERMISSION_VIEW_ONLY: ["viewer", "guest"],
+    })
+    acm.define_permissions("salary_band", {
+        AccessControlManager.PERMISSION_UPDATABLE: ["admin"],
+        AccessControlManager.PERMISSION_VIEW_ONLY: ["viewer"],
+        AccessControlManager.PERMISSION_HIDDEN: ["guest"],
+    })
+    acm.define_permissions("manager_note", {
+        AccessControlManager.PERMISSION_UPDATABLE: ["admin"],
+        AccessControlManager.PERMISSION_HIDDEN: ["viewer", "guest"],
+    })
+
+    viewer_file = tmp_path / "role_viewer_export.csv"
+    guest_file = tmp_path / "role_guest_export.csv"
+
+    viewer_dataset = creator.export_role_specific_dataset("viewer", acm, str(viewer_file))
+    guest_dataset = creator.export_role_specific_dataset("guest", acm, str(guest_file))
+
+    assert viewer_file.exists()
+    assert guest_file.exists()
+
+    assert "employee_id" in viewer_dataset.columns
+    assert "department" in viewer_dataset.columns
+    assert "salary_band" in viewer_dataset.columns
+    assert "manager_note" not in viewer_dataset.columns
+
+    assert "employee_id" in guest_dataset.columns
+    assert "department" in guest_dataset.columns
+    assert "salary_band" not in guest_dataset.columns
+    assert "manager_note" not in guest_dataset.columns
+
+
+def test_deterministic_seed_generation(tmp_path):
+    """Example 19: setting the same seed twice produces the same generated dataset."""
+    output_one = tmp_path / "seed_run_one.csv"
+    output_two = tmp_path / "seed_run_two.csv"
+
+    creator_one = DataSetCreator()
+    creator_one.set_seed(123)
+    creator_one.add_question("q1", ["A", "B"])
+    creator_one.add_question("q2", [1, 2, 3])
+    dataset_one = creator_one.generate_dataset_with_generator(str(output_one))
+
+    creator_two = DataSetCreator()
+    creator_two.set_seed(123)
+    creator_two.add_question("q1", ["A", "B"])
+    creator_two.add_question("q2", [1, 2, 3])
+    dataset_two = creator_two.generate_dataset_with_generator(str(output_two))
+
+    assert dataset_one.equals(dataset_two)
+
+
+def test_invalid_condition_syntax_rejected():
+    """Example 20: malformed conditions fail fast instead of being evaluated dynamically."""
+    creator = DataSetCreator()
+    creator.add_question("q1", ["Yes", "No"])
+    creator.add_question("q2", ["A", "B"])
+
+    try:
+        creator.add_logic(
+            "bad_logic",
+            rules=[
+                {"q1 == 'Yes' AND (q2 == 'A'": "X"},
+                {"default_value": "Y"},
+            ],
+            possible_values=["X", "Y"],
+        )
+    except ValueError as exc:
+        assert "Unbalanced" in str(exc) or "Invalid" in str(exc)
+    else:
+        raise AssertionError("Expected malformed logic condition to raise ValueError")
+
+
+def test_conflicting_acm_permissions_rejected():
+    """Example 21: the same role cannot be assigned conflicting permissions on one field."""
+    acm = AccessControlManager(name="conflict_acm")
+    acm.add_role("viewer")
+
+    try:
+        acm.define_permissions("salary", {
+            AccessControlManager.PERMISSION_VIEW_ONLY: ["viewer"],
+            AccessControlManager.PERMISSION_HIDDEN: ["viewer"],
+        })
+    except ValueError as exc:
+        assert "Conflicting permissions" in str(exc)
+    else:
+        raise AssertionError("Expected conflicting ACM permissions to raise ValueError")
+
+
+def test_profile_save_and_load(tmp_path):
+    """Example 22: dataset profiles can be saved and loaded back without losing configuration."""
+    profile_file = tmp_path / "dataset_profile.json"
+    creator = DataSetCreator()
+    creator.set_seed(99)
+    creator.add_question("q1", ["A", "B"], weights=[0.8, 0.2])
+    creator.add_logic("q2", [{"q1 == 'A'": "X"}, {"default_value": "Y"}], possible_values=["X", "Y"])
+    creator.save_profile(str(profile_file))
+
+    loaded = DataSetCreator.load_profile(str(profile_file))
+    assert profile_file.exists()
+    assert loaded.seed == 99
+    assert loaded.user_keys["q1"].weights == [0.8, 0.2]
+    assert loaded.logic_rules[0].target == "q2"
+
+
+def test_coverage_report_generation(tmp_path):
+    """Example 23: coverage reporting lists observed and missing answers and logic hits."""
+    creator = DataSetCreator()
+    creator.add_question("q1", ["A", "B"], generation_strategy="exhaustive")
+    creator.add_logic("q2", [{"q1 == 'A'": "X"}, {"default_value": "Y"}], possible_values=["X", "Y"])
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "coverage.csv"))
+    report = creator.generate_coverage_report(dataset)
+
+    assert report["answer_coverage"]
+    assert any(item["question"] == "q1" for item in report["answer_coverage"])
+    assert any(item["target"] == "q2" and item["hits"] >= 1 for item in report["logic_coverage"])
+
+
+def test_pairwise_generation_strategy(tmp_path):
+    """Example 24: pairwise strategy ensures value pairs appear across marked questions."""
+    creator = DataSetCreator()
+    creator.add_question("a", [1, 2], generation_strategy="pairwise")
+    creator.add_question("b", ["X", "Y"], generation_strategy="pairwise")
+    creator.add_question("c", [True, False])
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "pairwise.csv"))
+
+    observed = set(zip(dataset["a"], dataset["b"]))
+    assert observed == {(1, "X"), (1, "Y"), (2, "X"), (2, "Y")}
+
+
+def test_conditional_acm_permissions(tmp_path):
+    """Example 25: ACM record-level rules can hide a field only for specific rows."""
+    creator = DataSetCreator()
+    creator.add_question("department", ["HR", "IT"], generation_strategy="exhaustive")
+    creator.add_question("salary_band", ["A", "B"], generation_strategy="exhaustive")
+
+    acm = AccessControlManager(name="conditional_acm")
+    acm.add_role("viewer")
+    acm.define_permissions("department", {AccessControlManager.PERMISSION_VIEW_ONLY: ["viewer"]})
+    acm.define_permissions("salary_band", {AccessControlManager.PERMISSION_VIEW_ONLY: ["viewer"]})
+    acm.define_conditional_permission("salary_band", "viewer", "department == 'IT'", AccessControlManager.PERMISSION_HIDDEN)
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "conditional_acm.csv"), acm=acm)
+    acm_view = json.loads((tmp_path / "acm_conditional_acm.json").read_text(encoding="utf-8"))
+    assert any(
+        record["data"]["department"] == "IT" and record["permissions"]["viewer"]["salary_band"] == AccessControlManager.PERMISSION_HIDDEN
+        for record in acm_view.values()
+    )
+    assert any(
+        record["data"]["department"] == "HR" and record["permissions"]["viewer"]["salary_band"] == AccessControlManager.PERMISSION_VIEW_ONLY
+        for record in acm_view.values()
+    )
+    assert not dataset.empty
+
+
+def test_validation_and_excel_export(tmp_path):
+    """Example 26: validation reports issues and Excel export writes dataset and report sheets."""
+    creator = DataSetCreator()
+    creator.add_question("q1", ["A", "B"], weights=[1.0, 0.0])
+    creator.add_logic("q2", [{"q1 == 'A'": "X"}, {"default_value": "Y"}], possible_values=["X", "Y"])
+    validation = creator.validate()
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "excel_source.csv"))
+    excel_file = tmp_path / "dataset_bundle.xlsx"
+    creator.export_to_excel(dataset, str(excel_file))
+
+    assert validation["errors"] == []
+    assert excel_file.exists()
+
+
+def test_filter_csv_to_ui_payload(tmp_path):
+    """Example 27: filtered CSV output can be returned as a UI-ready dictionary of field values and calculations."""
+    creator = DataSetCreator()
+    creator.add_question("status", ["active", "inactive"], generation_strategy="exhaustive")
+    creator.add_question("member", [True, False], generation_strategy="exhaustive")
+    creator.add_logic(
+        "discount",
+        rules=[
+            {"status == 'active' AND member == True": "20%"},
+            {"default_value": "0%"},
+        ],
+        possible_values=["0%", "20%"],
+    )
+
+    output_file = tmp_path / "filter_payload.csv"
+    creator.generate_dataset_with_generator(str(output_file))
+    payload = creator.filter_csv_to_ui_payload(
+        str(output_file),
+        {"status": "active", "member": "True"},
+        include_all_matches=True,
+    )
+
+    assert payload["match_count"] >= 1
+    assert payload["field_values"]["status"] == "active"
+    assert payload["field_values"]["member"] is True
+    assert payload["calculations"]["discount"] == "20%"
+    assert payload["selected_record"]["discount"] == "20%"
+    assert payload["records"]
+
+
+def test_helper_methods_and_condition_builder(tmp_path):
+    """Example 28: helper methods and structured condition builder make the API easier to use."""
+    creator = DataSetCreator()
+    creator.add_base_question("age", [16, 25])
+    creator.add_base_question("member", [True, False])
+    creator.add_copy_question("copied_member", [True, False], copy_from="member")
+    creator.add_skipped_question("notes")
+    creator.add_conditional_question(
+        "status",
+        if_conditions=[
+            {ConditionBuilder.less_than("age", 18): "minor"},
+            {"default_value": "adult"},
+        ],
+        possible_answers=["minor", "adult"],
+        ui_role="calculation",
+    )
+    creator.add_logic(
+        "offer",
+        rules=[
+            {
+                ConditionBuilder.and_conditions(
+                    ConditionBuilder.equals("status", "minor"),
+                    ConditionBuilder.equals("member", True),
+                ): "special"
+            },
+            {"default_value": "standard"},
+        ],
+        possible_values=["special", "standard"],
+        ui_role="display",
+    )
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "helper_builder.csv"))
+    payload = creator.build_ui_payload(dataset, {"age": "16", "member": "True"})
+
+    assert (dataset["copied_member"] == dataset["member"]).all()
+    assert (dataset["notes"] == "SKIP").all()
+    assert payload["field_values"]["age"] == 16
+    assert payload["calculations"]["status"] == "minor"
+    assert payload["display_fields"]["offer"] == "special"
+
+
+def test_contradictory_configuration_rejected():
+    """Example 29: contradictory question configurations are rejected early."""
+    creator = DataSetCreator()
+    creator.add_base_question("base", ["A", "B"])
+    creator.add_logic("derived", [{"base == 'A'": "X"}, {"default_value": "Y"}], possible_values=["X", "Y"])
+
+    invalid_operations = [
+        lambda: creator.add_question("weighted_missing", ["A", "B"], generation_strategy="weighted_random"),
+        lambda: creator.add_question("skip_pairwise", ["A", "B"], skip=True, generation_strategy="pairwise"),
+        lambda: creator.add_question("copy_from_calc", ["X", "Y"], copy_from="derived"),
+    ]
+
+    for operation in invalid_operations:
+        try:
+            operation()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Expected contradictory configuration to raise ValueError")
+
+
+def test_validate_reports_group_warning():
+    """Example 30: validate() reports weak but non-fatal configurations like single-question groups."""
+    creator = DataSetCreator()
+    creator.add_base_question("only_grouped", ["A", "B"], group="solo_group")
+    report = creator.validate()
+
+    assert report["errors"] == []
+    assert any("solo_group" in warning for warning in report["warnings"])
+
+
+def test_advanced_condition_builder_composition(tmp_path):
+    """Example 31: advanced ConditionBuilder compositions can express reusable business rules clearly."""
+    creator = DataSetCreator()
+    creator.add_base_question("age", [16, 22, 35, 70], generation_strategy="exhaustive")
+    creator.add_base_question("member", [True, False], generation_strategy="exhaustive")
+    creator.add_base_question("income", [20000, 50000, 90000], generation_strategy="exhaustive")
+    creator.add_base_question("region", ["urban", "rural"], generation_strategy="exhaustive")
+
+    is_minor = ConditionBuilder.less_than("age", 18)
+    is_senior = ConditionBuilder.greater_equal("age", 65)
+    is_member = ConditionBuilder.equals("member", True)
+    low_income = ConditionBuilder.less_than("income", 30000)
+    urban_region = ConditionBuilder.equals("region", "urban")
+
+    high_discount = ConditionBuilder.or_conditions(
+        ConditionBuilder.and_conditions(is_minor, is_member),
+        ConditionBuilder.and_conditions(is_senior, urban_region),
+        low_income,
+    )
+
+    creator.add_logic(
+        "discount_level",
+        rules=[
+            {high_discount: "high"},
+            {ConditionBuilder.and_conditions(is_member, urban_region): "medium"},
+            {"default_value": "none"},
+        ],
+        possible_values=["none", "medium", "high"],
+        ui_role="calculation",
+    )
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "advanced_condition_builder.csv"))
+
+    assert not dataset.empty
+    for _, row in dataset.iterrows():
+        expected = "none"
+        if ((row["age"] < 18 and row["member"]) or
+                (row["age"] >= 65 and row["region"] == "urban") or
+                (row["income"] < 30000)):
+            expected = "high"
+        elif row["member"] and row["region"] == "urban":
+            expected = "medium"
+        assert row["discount_level"] == expected
+
+
+def test_risk_assessment_scorecard(tmp_path):
+    """Example 32: a risk scorecard can combine multiple factors into a final risk level."""
+    creator = DataSetCreator()
+    creator.add_base_question("age", [19, 30, 72], generation_strategy="exhaustive")
+    creator.add_base_question("smoker", [True, False], generation_strategy="exhaustive")
+    creator.add_base_question("bmi", [22, 29, 36], generation_strategy="exhaustive")
+    creator.add_base_question("chronic_condition", [True, False], generation_strategy="exhaustive")
+
+    creator.add_logic(
+        "risk_points",
+        rules=[
+            {
+                ConditionBuilder.or_conditions(
+                    ConditionBuilder.greater_equal("age", 70),
+                    ConditionBuilder.equals("chronic_condition", True),
+                ): 3
+            },
+            {
+                ConditionBuilder.or_conditions(
+                    ConditionBuilder.equals("smoker", True),
+                    ConditionBuilder.greater_equal("bmi", 35),
+                ): 2
+            },
+            {"default_value": 1},
+        ],
+        possible_values=[1, 2, 3],
+        ui_role="calculation",
+    )
+    creator.add_logic(
+        "risk_level",
+        rules=[
+            {"risk_points >= 3": "high"},
+            {"risk_points == 2": "medium"},
+            {"default_value": "low"},
+        ],
+        possible_values=["low", "medium", "high"],
+        ui_role="display",
+    )
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / "risk_scorecard.csv"))
+
+    assert not dataset.empty
+    for _, row in dataset.iterrows():
+        if row["age"] >= 70 or row["chronic_condition"]:
+            assert row["risk_points"] == 3
+            assert row["risk_level"] == "high"
+        elif row["smoker"] or row["bmi"] >= 35:
+            assert row["risk_points"] == 2
+            assert row["risk_level"] == "medium"
+        else:
+            assert row["risk_points"] == 1
+            assert row["risk_level"] == "low"
+
+
+def test_risk_assessment_ui_payload(tmp_path):
+    """Example 33: filtered risk scenarios can be returned as UI payloads with inputs, calculations, and display fields."""
+    creator = DataSetCreator()
+    creator.add_base_question("loan_amount", [5000, 25000, 80000], generation_strategy="exhaustive")
+    creator.add_base_question("late_payments", [0, 2, 5], generation_strategy="exhaustive")
+    creator.add_base_question("credit_score", [520, 680, 760], generation_strategy="exhaustive")
+    creator.add_logic(
+        "risk_score",
+        rules=[
+            {
+                ConditionBuilder.or_conditions(
+                    ConditionBuilder.greater_equal("late_payments", 5),
+                    ConditionBuilder.less_than("credit_score", 600),
+                ): 90
+            },
+            {
+                ConditionBuilder.or_conditions(
+                    ConditionBuilder.greater_equal("loan_amount", 50000),
+                    ConditionBuilder.greater_equal("late_payments", 2),
+                ): 60
+            },
+            {"default_value": 20},
+        ],
+        possible_values=[20, 60, 90],
+        ui_role="calculation",
+    )
+    creator.add_logic(
+        "risk_band",
+        rules=[
+            {"risk_score >= 90": "critical"},
+            {"risk_score >= 60": "review"},
+            {"default_value": "approve"},
+        ],
+        possible_values=["approve", "review", "critical"],
+        ui_role="display",
+    )
+
+    output_file = tmp_path / "risk_payload.csv"
+    dataset = creator.generate_dataset_with_generator(str(output_file))
+    critical_row = dataset[dataset["risk_band"] == "critical"].iloc[0]
+    payload = creator.filter_csv_to_ui_payload(
+        str(output_file),
+        {
+            "late_payments": str(critical_row["late_payments"]),
+            "credit_score": str(critical_row["credit_score"]),
+        },
+        include_all_matches=True,
+    )
+
+    assert payload["match_count"] >= 1
+    assert payload["field_values"]["late_payments"] == critical_row["late_payments"]
+    assert payload["field_values"]["credit_score"] == critical_row["credit_score"]
+    assert payload["calculations"]["risk_score"] == 90
+    assert payload["display_fields"]["risk_band"] == "critical"
+
+
+def test_add_logic_requires_referenced_questions():
+    """Example 1: logic rules must reference questions that already exist."""
+    creator = DataSetCreator()
+
+    try:
+        creator.add_logic(
+            target_question="discount",
+            rules=[
+                {"age < 18": "30%"},
+                {"default_value": "0%"},
+            ],
+            possible_values=["0%", "30%"],
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Expected ValueError when referenced questions are missing")
+
+    creator.add_question(key="age", possible_answers=[10, 20, 30])
+    creator.add_logic(
+        target_question="discount",
+        rules=[
+            {"age < 18": "30%"},
+            {"default_value": "0%"},
+        ],
+        possible_values=["0%", "30%"],
+    )
+
+
+def test_complex_bracketed_logic_relationships(tmp_path):
+    """Example 2: nested AND/OR conditions produce the expected age, membership, and discount values."""
+    creator = DataSetCreator()
+    creator.add_question(key="age", possible_answers=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70])
+    creator.add_question(key="is_student", possible_answers=[True, False])
+    creator.add_question(key="has_disability", possible_answers=[True, False])
+    creator.add_question(
+        key="age_group",
+        if_conditions=[
+            {"age < 13": "child"},
+            {"age >= 13 AND age < 20": "teen"},
+            {"age >= 20 AND age < 65": "adult"},
+            {"age >= 65": "senior"},
+            {"default_value": "adult"},
+        ],
+        possible_answers=["child", "teen", "adult", "senior"],
+    )
+    creator.add_question(
+        key="membership",
+        if_conditions=[
+            {"age_group == 'child'": "free"},
+            {"age_group == 'teen' AND is_student == True": "free"},
+            {"age_group == 'senior'": "basic"},
+            {"default_value": "premium"},
+        ],
+        possible_answers=["free", "basic", "premium"],
+    )
+    creator.add_logic(
+        target_question="discount",
+        rules=[
+            {"(age_group == 'child') OR (age < 18 AND membership == 'free')": "30%"},
+            {"(age_group == 'senior' AND membership == 'free') OR (has_disability == True)": "25%"},
+            {"(membership == 'premium') AND (is_student == False)": "20%"},
+            {"(is_student == True) AND (age_group == 'teen')": "15%"},
+            {"(age_group == 'senior' AND membership == 'basic')": "10%"},
+            {"default_value": "0%"},
+        ],
+        possible_values=["0%", "10%", "15%", "20%", "25%", "30%"],
+        position=5,
+    )
+    creator.add_question(
+        key="special_offer",
+        if_conditions=[
+            {"age_group == 'child' AND membership == 'free'": "Free toy"},
+            {"age_group == 'teen' AND is_student == True": "Student pack"},
+            {"age_group == 'senior' AND membership == 'basic'": "Senior wellness kit"},
+            {"membership == 'premium'": "Premium gift"},
+            {"default_value": "No offer"},
+        ],
+        possible_answers=["No offer", "Free toy", "Student pack", "Senior wellness kit", "Premium gift"],
+    )
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / 'complex_bracketed_logic.csv'))
+
+    assert not dataset.empty
+    for _, row in dataset.iterrows():
+        age = row['age']
+        if age < 13:
+            assert row['age_group'] == 'child'
+        elif age < 20:
+            assert row['age_group'] == 'teen'
+        elif age < 65:
+            assert row['age_group'] == 'adult'
+        else:
+            assert row['age_group'] == 'senior'
+
+        if row['age_group'] == 'child':
+            assert row['membership'] == 'free'
+        elif row['age_group'] == 'teen' and row['is_student']:
+            assert row['membership'] == 'free'
+        elif row['age_group'] == 'senior':
+            assert row['membership'] == 'basic'
+
+
+def test_email_reminder_system(tmp_path):
+    """Example 3: reminder emails change with account status and days since signup."""
+    creator = DataSetCreator()
+    creator.add_question(key="user_id", possible_answers=[1001, 1002, 1003, 1004], default_value=1001)
+    creator.add_question(key="user_name", possible_answers=["John Doe", "Jane Smith", "Bob Johnson", "Alice Brown"])
+    creator.add_question(key="user_email", possible_answers=[
+        "john@example.com",
+        "jane@example.com",
+        "bob@example.com",
+        "alice@example.com",
+    ])
+    creator.add_question(key="signup_date", possible_answers=[
+        "2023-01-15",
+        "2023-02-20",
+        "2023-03-10",
+        "2023-04-05",
+    ])
+    creator.add_question(key="account_status", possible_answers=["active", "inactive", "suspended"])
+    creator.add_question(key="days_since_signup", possible_answers=list(range(0, 365)))
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / 'email_reminders_prelim.csv'), helper_info=False)
+    today = datetime.now().date()
+    dataset['days_since_signup'] = dataset['signup_date'].apply(
+        lambda value: (today - datetime.strptime(value, '%Y-%m-%d').date()).days
+    )
+
+    creator = DataSetCreator()
+    creator.add_question(key="user_id", possible_answers=[1001, 1002, 1003, 1004], default_value=1001)
+    creator.add_question(key="user_name", possible_answers=["John Doe", "Jane Smith", "Bob Johnson", "Alice Brown"])
+    creator.add_question(key="user_email", possible_answers=[
+        "john@example.com",
+        "jane@example.com",
+        "bob@example.com",
+        "alice@example.com",
+    ])
+    creator.add_question(key="signup_date", possible_answers=[
+        "2023-01-15",
+        "2023-02-20",
+        "2023-03-10",
+        "2023-04-05",
+    ])
+    creator.add_question(key="account_status", possible_answers=["active", "inactive", "suspended"])
+    creator.add_question(key="days_since_signup", possible_answers=list(range(0, 365)))
+    creator.add_logic(
+        target_question="reminder_type",
+        rules=[
+            {"account_status != 'active'": "no_reminder"},
+            {"days_since_signup >= 90": "90-day reminder"},
+            {"days_since_signup >= 60": "60-day reminder"},
+            {"days_since_signup >= 30": "30-day reminder"},
+            {"default_value": "no_reminder"},
+        ],
+        possible_values=["no_reminder", "30-day reminder", "60-day reminder", "90-day reminder"],
+    )
+    creator.add_logic(
+        target_question="email_subject",
+        rules=[
+            {"reminder_type == '30-day reminder'": "Welcome back! Continue your journey"},
+            {"reminder_type == '60-day reminder'": "We miss you! Here's a special offer"},
+            {"reminder_type == '90-day reminder'": "Last chance! Your account will expire soon"},
+            {"default_value": ""},
+        ],
+        possible_values=[
+            "",
+            "Welcome back! Continue your journey",
+            "We miss you! Here's a special offer",
+            "Last chance! Your account will expire soon",
+        ],
+    )
+    creator.add_logic(
+        target_question="email_content",
+        rules=[
+            {
+                "reminder_type == '30-day reminder'": "Hi {user_name}, it's been 30 days since you joined. Check out our new features."},
+            {
+                "reminder_type == '60-day reminder'": "Dear {user_name}, as a 60-day member, you get 20% off. Use code SPECIAL60."},
+            {
+                "reminder_type == '90-day reminder'": "ATTENTION {user_name}: Your trial expires in 7 days. Upgrade now to avoid interruption."},
+            {"default_value": ""},
+        ],
+        possible_values=[
+            "",
+            "Hi {user_name}, it's been 30 days since you joined. Check out our new features.",
+            "Dear {user_name}, as a 60-day member, you get 20% off. Use code SPECIAL60.",
+            "ATTENTION {user_name}: Your trial expires in 7 days. Upgrade now to avoid interruption.",
+        ],
+    )
+    creator.add_logic(
+        target_question="email_link",
+        rules=[
+            {"reminder_type == '30-day reminder'": "https://example.com/welcome-back"},
+            {"reminder_type == '60-day reminder'": "https://example.com/special-offer"},
+            {"reminder_type == '90-day reminder'": "https://example.com/upgrade-now"},
+            {"default_value": ""},
+        ],
+        possible_values=[
+            "",
+            "https://example.com/welcome-back",
+            "https://example.com/special-offer",
+            "https://example.com/upgrade-now",
+        ],
+    )
+
+    dataset = creator._apply_logic_rules(dataset)
+    dataset.to_csv(tmp_path / 'email_reminder_final.csv', index=False)
+
+    for _, row in dataset.iterrows():
+        days = row['days_since_signup']
+        status = row['account_status']
+        reminder = row['reminder_type']
+
+        if status != 'active':
+            assert reminder == 'no_reminder'
+        elif days >= 90:
+            assert reminder == '90-day reminder'
+        elif days >= 60:
+            assert reminder == '60-day reminder'
+        elif days >= 30:
+            assert reminder == '30-day reminder'
+        else:
+            assert reminder == 'no_reminder'
+
+        if reminder == '30-day reminder':
+            assert 'Welcome back' in row['email_subject']
+            assert '30 days' in row['email_content']
+            assert 'welcome-back' in row['email_link']
+        elif reminder == '60-day reminder':
+            assert 'We miss you' in row['email_subject']
+            assert '60-day' in row['email_content']
+            assert 'special-offer' in row['email_link']
+        elif reminder == '90-day reminder':
+            assert 'Last chance' in row['email_subject']
+            assert 'expires in 7 days' in row['email_content']
+            assert 'upgrade-now' in row['email_link']
+        else:
+            assert row['email_subject'] == ''
+            assert row['email_content'] == ''
+            assert row['email_link'] == ''
+
+
+def test_access_control_system(tmp_path):
+    """Example 4: role-based permissions map to the correct submit, approve, edit, and view flags."""
+    creator = DataSetCreator()
+    creator.add_question(key="user_id", possible_answers=[101, 102, 103])
+    creator.add_question(key="user_name", possible_answers=["John Smith", "Sarah Lee", "David Chen"])
+    creator.add_question(key="user_role", possible_answers=["regular", "approver", "manager"])
+    creator.add_logic(
+        target_question="can_submit_form",
+        rules=[
+            {"user_role == 'regular' OR user_role == 'approver' OR user_role == 'manager'": "yes"},
+            {"default_value": "no"},
+        ],
+        possible_values=["yes", "no"],
+    )
+    creator.add_logic(
+        target_question="can_approve_form",
+        rules=[
+            {"user_role == 'approver' OR user_role == 'manager'": "yes"},
+            {"default_value": "no"},
+        ],
+        possible_values=["yes", "no"],
+    )
+    creator.add_logic(
+        target_question="can_edit_any_form",
+        rules=[
+            {"user_role == 'manager'": "yes"},
+            {"default_value": "no"},
+        ],
+        possible_values=["yes", "no"],
+    )
+    creator.add_logic(
+        target_question="can_view_all",
+        rules=[
+            {"user_role == 'manager'": "full"},
+            {"user_role == 'approver'": "partial"},
+            {"default_value": "no"},
+        ],
+        possible_values=["full", "partial", "no"],
+    )
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / 'access_control_test.csv'))
+
+    for _, row in dataset.iterrows():
+        if row['user_role'] in ['regular', 'approver', 'manager']:
+            assert row['can_submit_form'] == 'yes'
+        if row['user_role'] in ['approver', 'manager']:
+            assert row['can_approve_form'] == 'yes'
+        else:
+            assert row['can_approve_form'] == 'no'
+
+        if row['user_role'] == 'manager':
+            assert row['can_edit_any_form'] == 'yes'
+            assert row['can_view_all'] == 'full'
+        elif row['user_role'] == 'approver':
+            assert row['can_edit_any_form'] == 'no'
+            assert row['can_view_all'] == 'partial'
+        else:
+            assert row['can_edit_any_form'] == 'no'
+            assert row['can_view_all'] == 'no'
+
+
+def test_questionnaire_with_integrated_calculations(tmp_path):
+    """Example 5: derived answers and score calculations stay consistent across the questionnaire."""
+    creator = DataSetCreator()
+    creator.add_question(key="q1", possible_answers=["Yes", "No"], default_value="No")
+    creator.add_question(key="q2", possible_answers=["Option A", "Option B", "Option C"], default_value="Option A")
+    creator.add_question(
+        key="hidden_after_q2",
+        possible_answers=["Value 1", "Value 2", "Value 3"],
+        if_conditions=[
+            {"q2 == 'Option A'": "Value 1"},
+            {"q2 == 'Option B' AND q1 == 'Yes'": "Value 2"},
+            {"q2 == 'Option C'": "Value 3"},
+            {"default_value": "Value 1"},
+        ],
+    )
+    creator.add_logic(
+        target_question="hidden_value_score",
+        rules=[
+            {"hidden_after_q2 == 'Value 1'": 1},
+            {"hidden_after_q2 == 'Value 2'": 2},
+            {"hidden_after_q2 == 'Value 3'": 3},
+            {"default_value": 0},
+        ],
+        possible_values=[0, 1, 2, 3],
+    )
+    creator.add_question(
+        key="q3",
+        possible_answers=["Low", "Medium", "High"],
+        if_conditions=[
+            {"hidden_after_q2 == 'Value 1'": "Low"},
+            {"hidden_after_q2 == 'Value 2'": "Medium"},
+            {"hidden_after_q2 == 'Value 3'": "High"},
+            {"default_value": "Low"},
+        ],
+    )
+    creator.add_logic(
+        target_question="q3_score",
+        rules=[
+            {"q3 == 'Low'": 5},
+            {"q3 == 'Medium'": 10},
+            {"q3 == 'High'": 15},
+            {"default_value": 0},
+        ],
+        possible_values=[0, 5, 10, 15],
+    )
+    creator.add_question(
+        key="q4",
+        possible_answers=["Complete", "Incomplete"],
+        if_conditions=[
+            {"q3_score >= 10 AND hidden_value_score >= 2": "Complete"},
+            {"q1 == 'Yes' AND q3_score > 0": "Complete"},
+            {"default_value": "Incomplete"},
+        ],
+    )
+
+    dataset = creator.generate_dataset_with_generator(str(tmp_path / 'integrated_calculations_questionnaire.csv'))
+    dataset['final_result'] = dataset.apply(
+        lambda row: row['q3_score'] + row['hidden_value_score'] if row['q4'] == 'Complete' else row['q3_score'] - row[
+            'hidden_value_score'],
+        axis=1,
+    )
+
+    assert not dataset.empty
+    for _, row in dataset.iterrows():
+        expected = row['q3_score'] + row['hidden_value_score'] if row['q4'] == 'Complete' else row['q3_score'] - row[
+            'hidden_value_score']
+        assert row['final_result'] == expected
+
+
+def test_complex_bracketed_logic_with_acm():
+    """Example 6: generated data still works when access-control metadata is attached."""
+    creator = DataSetCreator()
+    creator.add_question(key="age", possible_answers=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70])
+    creator.add_question(key="is_student", possible_answers=[True, False])
+    creator.add_question(
+        key="age_group",
+        if_conditions=[
+            {"age < 13": "child"},
+            {"age >= 13 and age < 20": "teen"},
+            {"age >= 20 and age < 65": "adult"},
+            {"age >= 65": "senior"},
+            {"default_value": "adult"},
+        ],
+        possible_answers=["child", "teen", "adult", "senior"],
+    )
+    creator.add_question(
+        key="membership",
+        if_conditions=[
+            {"age_group == 'child'": "free"},
+            {"age_group == 'teen' and is_student == True": "free"},
+            {"age_group == 'senior'": "basic"},
+            {"default_value": "premium"},
+        ],
+        possible_answers=["free", "basic", "premium"],
+    )
+    creator.add_logic(
+        target_question="discount",
+        rules=[
+            {"age_group == 'child'": "30%"},
+            {"age_group == 'senior' and membership == 'free'": "25%"},
+            {"membership == 'premium' and is_student == False": "20%"},
+            {"is_student == True and age_group == 'teen'": "15%"},
+            {"age_group == 'senior' and membership == 'basic'": "10%"},
+            {"default_value": "0%"},
+        ],
+        possible_values=["0%", "10%", "15%", "20%", "25%", "30%"],
+    )
+    creator.add_question(
+        key="special_offer",
+        if_conditions=[
+            {"age_group == 'child' and membership == 'free'": "Free toy"},
+            {"age_group == 'teen' and is_student == True": "Student pack"},
+            {"age_group == 'senior' and membership == 'basic'": "Senior wellness kit"},
+            {"membership == 'premium'": "Premium gift"},
+            {"default_value": "No offer"},
+        ],
+        possible_answers=["No offer", "Free toy", "Student pack", "Senior wellness kit", "Premium gift"],
+    )
+
+    acm = AccessControlManager(name="age_membership_acm")
+    for role in ["admin", "editor", "viewer", "guest", "data_analyst"]:
+        acm.add_role(role)
+
+    acm.define_permissions("age", {
+        AccessControlManager.PERMISSION_UPDATABLE: ["admin"],
+        AccessControlManager.PERMISSION_VIEW_ONLY: ["editor", "data_analyst"],
+        AccessControlManager.PERMISSION_HIDDEN: ["guest"],
+    })
+    acm.define_permissions("membership", {
+        AccessControlManager.PERMISSION_UPDATABLE: ["admin", "editor"],
+        AccessControlManager.PERMISSION_VIEW_ONLY: ["data_analyst", "viewer"],
+        AccessControlManager.PERMISSION_HIDDEN: ["guest"],
+    })
+    acm.define_permissions("discount", {
+        AccessControlManager.PERMISSION_UPDATABLE: ["admin", "editor"],
+        AccessControlManager.PERMISSION_VIEW_ONLY: ["data_analyst", "viewer"],
+        AccessControlManager.PERMISSION_HIDDEN: ["guest"],
+    })
+    acm.define_permissions("age_group", {
+        AccessControlManager.PERMISSION_UPDATABLE: ["admin"],
+        AccessControlManager.PERMISSION_VIEW_ONLY: ["editor", "data_analyst", "viewer"],
+        AccessControlManager.PERMISSION_HIDDEN: ["guest"],
+    })
+    acm.define_permissions("special_offer", {
+        AccessControlManager.PERMISSION_UPDATABLE: ["admin", "editor"],
+        AccessControlManager.PERMISSION_VIEW_ONLY: ["data_analyst", "viewer", "guest"],
+    })
+
+    output_file = TEST_OUTPUT_DIR / "complex_bracketed_logic_with_acm.csv"
+    acm_output_file = TEST_OUTPUT_DIR / "acm_complex_bracketed_logic_with_acm.json"
+    dataset = creator.generate_dataset_with_generator(str(output_file), acm=acm)
+
+    assert not dataset.empty
+    assert acm_output_file.exists()
+    acm_view = json.loads(acm_output_file.read_text(encoding="utf-8"))
+    assert "record_0" in acm_view
+    assert "permissions" in acm_view["record_0"]
+    assert "admin" in acm_view["record_0"]["permissions"]
+    assert acm_view["record_0"]["permissions"]["admin"]["age"] == AccessControlManager.PERMISSION_UPDATABLE
+    for _, row in dataset.iterrows():
+        expected_group = 'child' if row['age'] < 13 else 'teen' if row['age'] < 20 else 'adult' if row[
+                                                                                                       'age'] < 65 else 'senior'
+        assert row['age_group'] == expected_group
+
+
+if __name__ == "__main__":
+    if TEST_OUTPUT_DIR.exists():
+        shutil.rmtree(TEST_OUTPUT_DIR)
+    TEST_OUTPUT_DIR.mkdir(exist_ok=True)
+
+    tests = [
+        test_add_logic_requires_referenced_questions,
+        test_complex_bracketed_logic_relationships,
+        test_email_reminder_system,
+        test_access_control_system,
+        test_questionnaire_with_integrated_calculations,
+        test_complex_bracketed_logic_with_acm,
+        test_base_questions,
+        test_dependency_questions,
+        test_if_conditions_default_value,
+        test_add_logic_basic,
+        test_add_logic_complex,
+        test_skip_logic,
+        test_copy_logic,
+        test_grouped_questions,
+        test_pre_generator_data,
+        test_all_features_combined,
+        test_dependency_with_if_condition,
+        test_role_specific_acm_export,
+        test_deterministic_seed_generation,
+        test_invalid_condition_syntax_rejected,
+        test_conflicting_acm_permissions_rejected,
+        test_profile_save_and_load,
+        test_coverage_report_generation,
+        test_pairwise_generation_strategy,
+        test_conditional_acm_permissions,
+        test_validation_and_excel_export,
+        test_filter_csv_to_ui_payload,
+        test_helper_methods_and_condition_builder,
+        test_contradictory_configuration_rejected,
+        test_validate_reports_group_warning,
+        test_advanced_condition_builder_composition,
+        test_risk_assessment_scorecard,
+        test_risk_assessment_ui_payload,
+    ]
+
+    failures = []
+
+    for test_func in tests:
+        try:
+            explanation = (test_func.__doc__ or "No explanation provided.").strip()
+            print(f"\nRunning {test_func.__name__}: {explanation}")
+            if "tmp_path" in test_func.__code__.co_varnames[:test_func.__code__.co_argcount]:
+                test_func(TEST_OUTPUT_DIR)
+            else:
+                test_func()
+            print(f"PASS: {test_func.__name__}")
+        except Exception as exc:
+            failures.append((test_func.__name__, exc))
+            print(f"FAIL: {test_func.__name__}")
+            traceback.print_exc()
+
+    total = len(tests)
+    passed = total - len(failures)
+    print(f"\nSummary: {passed}/{total} tests passed")
+
+    if failures:
+        print("Failed tests: " + ", ".join(name for name, _ in failures))
+        raise SystemExit(1)
+
+    print("All tests passed.")
