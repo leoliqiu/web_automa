@@ -1,1 +1,3242 @@
+import sys
+import re
+import os
+import html
+import pandas as pd
+from collections import defaultdict
+from datetime import datetime
+
+from PyQt6.QtWidgets import *
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer
+from PyQt6.QtGui import QFont, QIcon
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.relative_locator import locate_with
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
+from webdriver_manager.chrome import ChromeDriverManager
+
+
+class BrowserLaunchWorker(QObject):
+    """Worker thread for launching browser to prevent UI freezing."""
+    success = pyqtSignal(object)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self.driver = None
+
+    def run(self):
+        """Run browser launch in background thread."""
+        try:
+            print(f"[Browser] Starting Chrome with URL: {self.url}")
+
+            options = Options()
+            options.add_argument("--start-maximized")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
+
+            print("[Browser] Locating ChromeDriver...")
+
+            # Try local ChromeDriver first (C:\Python311)
+            local_chromedriver = r"C:\Python311\chromedriver.exe"
+            if os.path.exists(local_chromedriver):
+                chromedriver_path = local_chromedriver
+                print(f"[Browser] Using local ChromeDriver: {chromedriver_path}")
+            else:
+                # Fallback to ChromeDriverManager
+                print("[Browser] Installing ChromeDriver from webdriver-manager...")
+                try:
+                    chromedriver_path = ChromeDriverManager().install()
+                    print(f"[Browser] ChromeDriver path: {chromedriver_path}")
+                except Exception as e:
+                    print(f"[Browser] ChromeDriver error: {str(e)}")
+                    raise Exception(f"Failed to get ChromeDriver: {str(e)}")
+
+            print(f"[Browser] Creating Chrome instance...")
+            self.driver = webdriver.Chrome(
+                service=Service(chromedriver_path),
+                options=options
+            )
+
+            print(f"[Browser] Setting timeouts...")
+            self.driver.set_page_load_timeout(30)
+            self.driver.set_script_timeout(30)
+
+            print(f"[Browser] Navigating to {self.url}...")
+            self.driver.get(self.url)
+
+            print(f"[Browser] Browser launched successfully!")
+            self.success.emit(self.driver)
+
+        except Exception as e:
+            error_msg = f"{str(e)}\n\nType: {type(e).__name__}\n\nTroubleshooting:\n- Make sure Chrome browser is installed\n- Internet connection is available\n- URL is valid (e.g., https://www.wikipedia.org)\n- Try checking proxy settings if behind corporate firewall"
+            print(f"[Browser] Error: {str(e)}")
+            self.error.emit(error_msg)
+        finally:
+            self.finished.emit()
+
+
+class EnterpriseDashboard(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Enterprise Locator Intelligence Dashboard")
+        self.setGeometry(60, 40, 1680, 980)
+        self.driver = None
+        self.engine = None
+        self.browser_thread = None
+        self.browser_worker = None
+        self.browser_launch_in_progress = False
+        self.processing_count = 0
+        self.selection_poll_timer = None
+        self.bg_color_toggle = True
+        self.preview_text_limit = 200
+        self.expanded_text_registry = {}
+        self.init_ui()
+        self.statusBar().showMessage("Ready. Use the Page Navigation panel to launch the browser.")
+
+    def ensure_driver(self):
+        if self.driver is None:
+            QMessageBox.warning(self, "No Browser", "Browser is not launched. Please use 'Browser > Launch' first.")
+            return False
+        return True
+
+    def _set_browser_status(self, is_online):
+        """Update the browser status badge in the header."""
+        if not hasattr(self, 'browser_status_badge'):
+            return
+        self.browser_status_badge.setText("Browser Online" if is_online else "Browser Offline")
+        self.browser_status_badge.setObjectName("statusBadgeOnline" if is_online else "statusBadgeOffline")
+        self.browser_status_badge.style().unpolish(self.browser_status_badge)
+        self.browser_status_badge.style().polish(self.browser_status_badge)
+        self.browser_status_badge.update()
+
+    def _set_processing_status(self, is_processing, message=None):
+        """Show or hide the processing badge, and disable UI interaction while work is active."""
+        if is_processing:
+            self.processing_count += 1
+        else:
+            self.processing_count = max(0, self.processing_count - 1)
+
+        is_active = self.processing_count > 0
+        if hasattr(self, 'processing_status_badge'):
+            self.processing_status_badge.setText("Processing" if is_active else "Idle")
+            self.processing_status_badge.setVisible(is_active)
+        if hasattr(self, 'main_interaction_widget'):
+            self.main_interaction_widget.setEnabled(not is_active)
+        if message:
+            self.statusBar().showMessage(message)
+
+    def init_ui(self):
+        self.setMinimumSize(1560, 960)
+        self._apply_modern_theme()
+        self.menuBar().hide()
+
+        central = QWidget()
+        central.setObjectName("centralSurface")
+        self.main_interaction_widget = central
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(16)
+
+        controls_splitter = QSplitter(Qt.Orientation.Horizontal)
+        controls_splitter.setChildrenCollapsible(False)
+        controls_splitter.setHandleWidth(10)
+
+        navigation_card = self._create_card("NavigationCard")
+        navigation_layout = QVBoxLayout(navigation_card)
+        navigation_layout.setContentsMargins(20, 20, 20, 20)
+        navigation_layout.setSpacing(14)
+
+        nav_header_layout = QHBoxLayout()
+        nav_header_layout.setSpacing(12)
+        nav_title_wrap = QVBoxLayout()
+        nav_title_wrap.setSpacing(4)
+        workspace_title = QLabel("Locator Intelligence Workspace")
+        workspace_title.setObjectName("sectionTitle")
+        nav_title = QLabel("Page Navigation")
+        nav_title.setObjectName("fieldLabel")
+        nav_title_wrap.addWidget(workspace_title)
+        nav_title_wrap.addWidget(nav_title)
+        nav_header_layout.addLayout(nav_title_wrap, 1)
+
+        self.browser_status_badge = QLabel("Browser Offline")
+        self.browser_status_badge.setObjectName("statusBadgeOffline")
+        self.browser_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.browser_status_badge.setMinimumWidth(160)
+        nav_header_layout.addWidget(self.browser_status_badge, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.processing_status_badge = QLabel("Idle")
+        self.processing_status_badge.setObjectName("statusBadgeProcessing")
+        self.processing_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.processing_status_badge.setMinimumWidth(120)
+        self.processing_status_badge.hide()
+        nav_header_layout.addWidget(self.processing_status_badge, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        navigation_layout.addLayout(nav_header_layout)
+
+        nav_hint = QLabel("Open the browser, then navigate to the page you want to inspect.")
+        nav_hint.setObjectName("sectionHint")
+        nav_hint.setWordWrap(True)
+        navigation_layout.addWidget(nav_hint)
+
+        url_layout = QHBoxLayout()
+        url_layout.setSpacing(10)
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("Enter URL (e.g., https://en.wikipedia.org/wiki/National_Basketball_Association)")
+        self.url_input.setMinimumHeight(42)
+        url_layout.addWidget(self.url_input)
+        open_btn = QPushButton("Open")
+        open_btn.clicked.connect(self.open_url)
+        open_btn.setObjectName("secondaryButton")
+        url_layout.addWidget(open_btn)
+        navigation_layout.addLayout(url_layout)
+
+        browser_actions_layout = QHBoxLayout()
+        browser_actions_layout.setSpacing(10)
+        launch_btn = QPushButton("Launch Browser")
+        launch_btn.clicked.connect(self.launch_browser)
+        launch_btn.setObjectName("primaryButton")
+        browser_actions_layout.addWidget(launch_btn)
+        close_btn = QPushButton("Close Browser")
+        close_btn.clicked.connect(self.close_browser)
+        close_btn.setObjectName("secondaryButton")
+        browser_actions_layout.addWidget(close_btn)
+        browser_actions_layout.addStretch(1)
+        navigation_layout.addLayout(browser_actions_layout)
+
+        locator_card = self._create_card("LocatorCard")
+        locator_layout = QVBoxLayout(locator_card)
+        locator_layout.setContentsMargins(20, 20, 20, 20)
+        locator_layout.setSpacing(14)
+
+        locator_title_row = QHBoxLayout()
+        locator_title_row.setSpacing(8)
+        locator_title = QLabel("Locator Discovery")
+        locator_title.setObjectName("sectionTitle")
+        locator_title_row.addWidget(locator_title)
+        locator_tip_button = QToolButton()
+        locator_tip_button.setText("?")
+        locator_tip_button.setToolTip("Use 'Find All Versions' to generate an on-screen report and a saved HTML export.")
+        locator_tip_button.setAutoRaise(True)
+        locator_title_row.addWidget(locator_tip_button, 0, Qt.AlignmentFlag.AlignLeft)
+        locator_title_row.addStretch(1)
+        locator_hint = QLabel("Analyze a locator, find every matching record, or capture an element directly from the page.")
+        locator_hint.setObjectName("sectionHint")
+        locator_hint.setWordWrap(True)
+        locator_layout.addLayout(locator_title_row)
+        locator_layout.addWidget(locator_hint)
+
+        loc_layout = QGridLayout()
+        loc_layout.setHorizontalSpacing(10)
+        loc_layout.setVerticalSpacing(10)
+        self.locator_input = QLineEdit()
+        self.locator_input.setPlaceholderText("XPath or search term (e.g., //button, English)")
+        self.locator_input.setMinimumHeight(42)
+        loc_layout.addWidget(self.locator_input, 0, 0, 1, 3)
+        analyze_btn = QPushButton("Analyze Locator")
+        analyze_btn.clicked.connect(self.analyze_locator)
+        analyze_btn.setObjectName("primaryButton")
+        loc_layout.addWidget(analyze_btn, 1, 0)
+        find_all_btn = QPushButton("Find All Versions")
+        find_all_btn.clicked.connect(self.find_all_versions_comprehensive)
+        find_all_btn.setObjectName("accentButton")
+        loc_layout.addWidget(find_all_btn, 1, 1)
+        click_element_btn = QPushButton("Click Element on Page")
+        click_element_btn.clicked.connect(self.enable_element_selection)
+        click_element_btn.setObjectName("secondaryButton")
+        loc_layout.addWidget(click_element_btn, 1, 2)
+        loc_layout.setColumnStretch(0, 1)
+        loc_layout.setColumnStretch(1, 1)
+        loc_layout.setColumnStretch(2, 1)
+        locator_layout.addLayout(loc_layout)
+
+        controls_splitter.addWidget(navigation_card)
+        controls_splitter.addWidget(locator_card)
+        controls_splitter.setSizes([520, 1040])
+        main_layout.addWidget(controls_splitter)
+
+        workspace_tabs = QTabWidget()
+        workspace_tabs.setObjectName("workspaceTabs")
+        workspace_tabs.tabBar().setObjectName("workspaceTabBar")
+        workspace_tabs.tabBar().setExpanding(False)
+        workspace_tabs.tabBar().setUsesScrollButtons(False)
+        self.workspace_tabs = workspace_tabs
+
+        tester_page = QWidget()
+        tester_page_layout = QVBoxLayout(tester_page)
+        tester_page_layout.setContentsMargins(0, 0, 0, 0)
+        tester_page_layout.setSpacing(14)
+
+        tester_group = self._create_card("TesterCard")
+        tester_layout = QVBoxLayout(tester_group)
+        tester_layout.setContentsMargins(20, 20, 20, 20)
+        tester_layout.setSpacing(14)
+
+        tester_title = QLabel("Locator Tester")
+        tester_title.setObjectName("sectionTitle")
+        tester_hint = QLabel(
+            "Validate a locator before using it. Generate Stable XPath inspects the found element and proposes several stronger XPath options."
+        )
+        tester_hint.setObjectName("sectionHint")
+        tester_hint.setWordWrap(True)
+        tester_layout.addWidget(tester_title)
+        tester_layout.addWidget(tester_hint)
+
+        test_form_layout = QGridLayout()
+        test_form_layout.setHorizontalSpacing(12)
+        test_form_layout.setVerticalSpacing(12)
+        self.test_locator_input = QLineEdit()
+        self.test_locator_input.setPlaceholderText("Enter locator to test")
+        self.test_locator_input.setMinimumHeight(42)
+        locator_label = QLabel("Locator")
+        locator_label.setObjectName("fieldLabel")
+        test_form_layout.addWidget(locator_label, 0, 0)
+        test_form_layout.addWidget(self.test_locator_input, 0, 1)
+
+        self.locator_type_combo = QComboBox()
+        self.locator_type_combo.addItems([
+            "Auto-Detect",
+            "XPath",
+            "ID",
+            "CSS Selector",
+            "Class Name",
+            "Tag Name",
+            "Link Text",
+            "Partial Link Text",
+            "Name",
+            "Text (Contains)"
+        ])
+        self.locator_type_combo.setMinimumHeight(42)
+        self.locator_type_combo.setMaximumWidth(260)
+        type_label = QLabel("Type")
+        type_label.setObjectName("fieldLabel")
+        test_form_layout.addWidget(type_label, 0, 2)
+        test_form_layout.addWidget(self.locator_type_combo, 0, 3)
+        test_form_layout.setColumnStretch(1, 1)
+
+        tester_layout.addLayout(test_form_layout)
+
+        tester_action_layout = QHBoxLayout()
+        tester_action_layout.setSpacing(10)
+
+        test_btn = QPushButton("Test Locator")
+        test_btn.clicked.connect(self.test_locator)
+        test_btn.setObjectName("primaryButton")
+        tester_action_layout.addWidget(test_btn, 1)
+
+        get_value_btn = QPushButton("Get Value")
+        get_value_btn.clicked.connect(self.get_test_locator_value)
+        get_value_btn.setObjectName("secondaryButton")
+        tester_action_layout.addWidget(get_value_btn, 1)
+
+        click_test_btn = QPushButton("Click Locator")
+        click_test_btn.clicked.connect(self.click_test_locator)
+        click_test_btn.setObjectName("accentButton")
+        tester_action_layout.addWidget(click_test_btn, 1)
+
+        dynamic_xpath_btn = QPushButton("Generate Stable XPath")
+        dynamic_xpath_btn.clicked.connect(self.generate_dynamic_xpath)
+        dynamic_xpath_btn.setObjectName("secondaryButton")
+        dynamic_xpath_btn.setToolTip("Find the current element, inspect its DOM context, and generate several validated stable XPath options.")
+        tester_action_layout.addWidget(dynamic_xpath_btn, 1)
+
+        locator_result_btn = QPushButton("Locator Result")
+        locator_result_btn.clicked.connect(self.show_locator_result_details)
+        locator_result_btn.setObjectName("secondaryButton")
+        locator_result_btn.setToolTip("Show the element XPath plus parent-class, next-sibling, and previous-sibling locator options.")
+        tester_action_layout.addWidget(locator_result_btn, 1)
+        tester_layout.addLayout(tester_action_layout)
+
+        tester_options_layout = QGridLayout()
+        tester_options_layout.setHorizontalSpacing(12)
+        tester_options_layout.setVerticalSpacing(10)
+
+        self.dropdown_toggle = QCheckBox("Element is dropdown / option")
+        self.dropdown_toggle.setChecked(False)
+        tester_options_layout.addWidget(self.dropdown_toggle, 0, 0)
+
+        self.wait_for_options_toggle = QCheckBox("Wait for options automatically")
+        self.wait_for_options_toggle.setChecked(True)
+        tester_options_layout.addWidget(self.wait_for_options_toggle, 0, 1)
+
+        self.table_toggle = QCheckBox("Target is inside table")
+        self.table_toggle.setChecked(False)
+        tester_options_layout.addWidget(self.table_toggle, 0, 2)
+
+        tester_options_layout.setColumnStretch(0, 1)
+        tester_options_layout.setColumnStretch(1, 1)
+        tester_options_layout.setColumnStretch(2, 1)
+        tester_layout.addLayout(tester_options_layout)
+
+        self.test_result_display = QTextEdit()
+        self.test_result_display.setReadOnly(True)
+        self.test_result_display.setMinimumHeight(420)
+        self.test_result_display.setPlaceholderText("Test results will appear here.")
+        test_results_label = QLabel("Test Results")
+        test_results_label.setObjectName("fieldLabel")
+        tester_layout.addWidget(test_results_label)
+        tester_layout.addWidget(self.test_result_display)
+
+        tester_page_layout.addWidget(tester_group)
+        self.tester_tab_index = workspace_tabs.addTab(tester_page, "Tester")
+
+        results_page = QWidget()
+        results_layout = QVBoxLayout(results_page)
+        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_layout.setSpacing(14)
+
+        results_tabs = QTabWidget()
+        results_tabs.setObjectName("resultsTabs")
+        self.results_tabs = results_tabs
+
+        output_card = self._create_card("OutputCard")
+        output_layout = QVBoxLayout(output_card)
+        output_layout.setContentsMargins(20, 20, 20, 20)
+        output_layout.setSpacing(14)
+
+        output_title = QLabel("Analysis Output")
+        output_title.setObjectName("sectionTitle")
+        output_hint = QLabel("Structured HTML reports and analysis details are shown here.")
+        output_hint.setObjectName("sectionHint")
+        output_layout.addWidget(output_title)
+        output_layout.addWidget(output_hint)
+
+        self.output = QTextBrowser()
+        self.output.setReadOnly(True)
+        self.output.setPlaceholderText("Analysis output will appear here.")
+        self.output.setOpenLinks(False)
+        self.output.anchorClicked.connect(self._handle_output_link)
+        output_layout.addWidget(self.output)
+
+        table_card = self._create_card("TableGridCard")
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(20, 20, 20, 20)
+        table_layout.setSpacing(14)
+
+        table_title = QLabel("Table Data Grid")
+        table_title.setObjectName("sectionTitle")
+        table_hint = QLabel("Extracted table data is displayed here as a grid.")
+        table_hint.setObjectName("sectionHint")
+        table_hint.setWordWrap(True)
+        table_layout.addWidget(table_title)
+        table_layout.addWidget(table_hint)
+
+        self.table_grid = QTableWidget()
+        self.table_grid.setAlternatingRowColors(True)
+        self.table_grid.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_grid.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_grid.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_grid.horizontalHeader().setStretchLastSection(True)
+        self.table_grid.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table_grid.itemClicked.connect(self._handle_table_item_click)
+        table_layout.addWidget(self.table_grid)
+
+        results_tabs.addTab(output_card, "Output")
+        self.results_table_tab_index = results_tabs.addTab(table_card, "Table Grid")
+        results_layout.addWidget(results_tabs)
+        self.results_tab_index = workspace_tabs.addTab(results_page, "Results")
+
+        frame_page = QWidget()
+        frame_layout = QVBoxLayout(frame_page)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        frame_layout.setSpacing(14)
+
+        frame_card = self._create_card("FrameCard")
+        frame_card_layout = QVBoxLayout(frame_card)
+        frame_card_layout.setContentsMargins(20, 20, 20, 20)
+        frame_card_layout.setSpacing(14)
+
+        frame_title = QLabel("Downloaded Frame HTML")
+        frame_title.setObjectName("sectionTitle")
+        frame_hint = QLabel("Saved main document and iframe HTML snapshots are listed here.")
+        frame_hint.setObjectName("sectionHint")
+        frame_hint.setWordWrap(True)
+        frame_card_layout.addWidget(frame_title)
+        frame_card_layout.addWidget(frame_hint)
+
+        self.frame_download_list = QListWidget()
+        frame_card_layout.addWidget(self.frame_download_list)
+
+        frame_layout.addWidget(frame_card)
+        self.frame_tab_index = workspace_tabs.addTab(frame_page, "Frames")
+
+        main_layout.addWidget(workspace_tabs, 1)
+
+        central.setLayout(main_layout)
+        self.setCentralWidget(central)
+        self.statusBar().setObjectName("appStatusBar")
+        self._update_workspace_tabbar_width()
+
+    def _create_card(self, object_name):
+        frame = QFrame()
+        frame.setObjectName(object_name)
+        frame.setFrameShape(QFrame.Shape.NoFrame)
+        return frame
+
+    def _apply_modern_theme(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background: #ffffff;
+            }
+            QWidget#centralSurface {
+                background: #ffffff;
+            }
+            QFrame#NavigatorHeader,
+            QFrame#NavigationCard,
+            QFrame#LocatorCard,
+            QFrame#TesterCard,
+            QFrame#OutputCard,
+            QFrame#TableGridCard,
+            QFrame#FrameCard {
+                background: #ffffff;
+                border: 1px solid #bfdbfe;
+                border-radius: 0px;
+            }
+            QLabel#heroTitle {
+                font-size: 28px;
+                font-weight: 700;
+                color: #0f172a;
+            }
+            QLabel#heroSubtitle,
+            QLabel#sectionHint,
+            QLabel#helperText {
+                color: #475569;
+                font-size: 13px;
+            }
+            QLabel#sectionTitle {
+                font-size: 20px;
+                font-weight: 700;
+                color: #0f172a;
+            }
+            QLabel#fieldLabel {
+                color: #1e293b;
+                font-size: 13px;
+                font-weight: 600;
+                min-width: 44px;
+            }
+            QCheckBox {
+                color: #334155;
+                font-size: 13px;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 0px;
+                border: 1px solid #94a3b8;
+                background: #ffffff;
+            }
+            QCheckBox::indicator:checked {
+                background: #2563eb;
+                border: 1px solid #1d4ed8;
+            }
+            QLabel#statusBadgeOffline,
+            QLabel#statusBadgeOnline,
+            QLabel#statusBadgeProcessing {
+                padding: 12px 18px;
+                border-radius: 0px;
+                font-weight: 700;
+                font-size: 13px;
+            }
+            QLabel#statusBadgeOffline {
+                background: #fee2e2;
+                color: #991b1b;
+                border: 1px solid #fecaca;
+            }
+            QLabel#statusBadgeOnline {
+                background: #dcfce7;
+                color: #166534;
+                border: 1px solid #86efac;
+            }
+            QLabel#statusBadgeProcessing {
+                background: #fef3c7;
+                color: #92400e;
+                border: 1px solid #fcd34d;
+            }
+            QLineEdit, QComboBox, QTextEdit {
+                background: #ffffff;
+                color: #0f172a;
+                border: 1px solid #cbd5e1;
+                border-radius: 0px;
+                padding: 10px 12px;
+                selection-background-color: #93c5fd;
+                font-size: 13px;
+            }
+            QListWidget, QTableWidget, QHeaderView::section {
+                background: #ffffff;
+                color: #0f172a;
+            }
+            QLineEdit:focus, QComboBox:focus, QTextEdit:focus {
+                border: 2px solid #3b82f6;
+                background: #ffffff;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 28px;
+            }
+            QPushButton {
+                min-height: 42px;
+                max-height: 42px;
+                padding: 0 16px;
+                border-radius: 0px;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QPushButton#primaryButton {
+                background: #2563eb;
+                color: white;
+                border: 1px solid #1d4ed8;
+            }
+            QPushButton#primaryButton:hover {
+                background: #1d4ed8;
+            }
+            QPushButton#accentButton {
+                background: #0f766e;
+                color: white;
+                border: 1px solid #115e59;
+            }
+            QPushButton#accentButton:hover {
+                background: #115e59;
+            }
+            QPushButton#secondaryButton {
+                background: #eef2ff;
+                color: #1e3a8a;
+                border: 1px solid #bfdbfe;
+            }
+            QPushButton#secondaryButton:hover {
+                background: #dbeafe;
+            }
+            QTabWidget::pane {
+                border: none;
+                background: transparent;
+            }
+            QTabBar {
+                background: transparent;
+            }
+            QTabBar::tab {
+                background: #f8fafc;
+                color: #334155;
+                min-height: 28px;
+                padding: 6px 14px;
+                margin-right: 8px;
+                border-top-left-radius: 0px;
+                border-top-right-radius: 0px;
+                border: 1px solid #bfdbfe;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #0f172a;
+                border-bottom-color: #ffffff;
+                font-weight: 700;
+            }
+            QSplitter::handle {
+                background: transparent;
+            }
+            QStatusBar#appStatusBar {
+                background: #ffffff;
+                color: #1e3a8a;
+                border-top: 1px solid #bfdbfe;
+            }
+        """)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_workspace_tabbar_width()
+
+    def _update_workspace_tabbar_width(self):
+        """Keep the workspace tab bar compact and limited to half the window width."""
+        if not hasattr(self, 'workspace_tabs'):
+            return
+        tab_bar = self.workspace_tabs.tabBar()
+        tab_bar.setFixedWidth(max(360, int(self.width() * 0.5)))
+        tab_bar.setFixedHeight(34)
+
+    def launch_browser(self):
+        if self.browser_launch_in_progress:
+            self.output.append("Browser launch is already in progress. Please wait.")
+            self._set_processing_status(True, "Browser launch already in progress...")
+            return
+
+        if self.driver is not None:
+            reply = QMessageBox.question(self, "Browser Running",
+                "Browser is already running. Close and restart?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                return
+            self.close_browser()
+
+        url = self.url_input.text().strip()
+        if not url:
+            url = "https://en.wikipedia.org/wiki/National_Basketball_Association"
+            self.url_input.setText(url)
+
+        self.output.append(f"Launching browser with {url}... Please wait (this may take 10-30 seconds).")
+        self._set_processing_status(True, "Launching browser...")
+        self.browser_launch_in_progress = True
+
+        # Launch browser in background thread to prevent UI freeze
+        self.browser_thread = QThread()
+        self.browser_worker = BrowserLaunchWorker(url)
+        self.browser_worker.moveToThread(self.browser_thread)
+
+        # Connect signals
+        self.browser_thread.started.connect(self.browser_worker.run)
+        self.browser_worker.success.connect(self.on_browser_success)
+        self.browser_worker.error.connect(self.on_browser_error)
+        self.browser_worker.finished.connect(self.browser_thread.quit)
+        self.browser_worker.finished.connect(self.browser_worker.deleteLater)
+        self.browser_thread.finished.connect(self.browser_thread.deleteLater)
+        self.browser_thread.finished.connect(self._on_browser_launch_finished)
+
+        # Start thread
+        self.browser_thread.start()
+
+    def _on_browser_launch_finished(self):
+        """Reset browser launch state after the worker thread exits."""
+        self.browser_launch_in_progress = False
+        self.browser_thread = None
+        self.browser_worker = None
+
+    def on_browser_success(self, driver):
+        """Handle successful browser launch."""
+        self.driver = driver
+        self.output.append(f"✓ Browser launched successfully")
+        self._set_browser_status(True)
+        self._set_processing_status(False, "Browser launched - Ready to use")
+        self.statusBar().showMessage("Browser launched - Ready to use")
+
+    def on_browser_error(self, error_msg):
+        """Handle browser launch error."""
+        QMessageBox.critical(self, "Browser Launch Error", f"Failed to launch browser:\n\n{error_msg}")
+        self.output.append(f"✗ Browser launch failed: {error_msg}")
+        self.driver = None
+        self._set_browser_status(False)
+        self._set_processing_status(False, "Browser launch failed")
+
+    def close_browser(self):
+        if self.browser_launch_in_progress:
+            self.output.append("Browser launch is still in progress. Wait for it to finish before closing.")
+            return
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
+            self.driver = None
+        self._set_browser_status(False)
+        self._set_processing_status(False, "Browser closed")
+        self.output.append("Browser closed")
+
+    def open_url(self):
+        if not self.ensure_driver():
+            return
+        url = self.url_input.text().strip()
+        if not url:
+            self.output.append("Please enter a URL.")
+            return
+        self._set_processing_status(True, f"Opening {url} ...")
+        try:
+            self.driver.get(url)
+            self.output.append(f"Opened: {url}")
+            self._set_processing_status(False, f"Opened {url}")
+        except Exception as e:
+            self.output.append(f"Failed to open URL: {str(e)}")
+            self._set_processing_status(False, "Failed to open URL")
+
+    def download_html(self):
+        try:
+            html = self.driver.page_source
+            export_dir = self._get_export_directory()
+            filename = f"page_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            file_path = os.path.join(export_dir, filename)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(html)
+            return html, file_path
+        except Exception as e:
+            self.output.append(f"Failed to download HTML: {str(e)}")
+            return None, None
+
+    def _switch_to_frame_path(self, frame_path):
+        """Switch Selenium context to the given nested frame path."""
+        self.driver.switch_to.default_content()
+        for frame_index in frame_path:
+            frames = self.driver.find_elements(By.CSS_SELECTOR, 'iframe, frame')
+            if frame_index >= len(frames):
+                raise IndexError(f'Frame index {frame_index} out of range for path {frame_path}')
+            self.driver.switch_to.frame(frames[frame_index])
+
+    def _collect_frame_paths(self, frame_path=None, max_depth=10):
+        """Collect all reachable frame paths starting from the main document."""
+        frame_path = frame_path or []
+        paths = [list(frame_path)]
+
+        if len(frame_path) >= max_depth:
+            return paths
+
+        self._switch_to_frame_path(frame_path)
+        frame_count = len(self.driver.find_elements(By.CSS_SELECTOR, 'iframe, frame'))
+        for index in range(frame_count):
+            paths.extend(self._collect_frame_paths(frame_path + [index], max_depth))
+        return paths
+
+    def _format_frame_path(self, frame_path):
+        """Convert a frame path list into a readable label."""
+        if not frame_path:
+            return 'main document'
+        return ' > '.join(f'iframe[{index + 1}]' for index in frame_path)
+
+    def _extract_element_details(self, element, frame_path):
+        """Capture element details before switching out of its frame."""
+        return {
+            'tag': element.tag_name,
+            'id': element.get_attribute('id') or '(none)',
+            'class': element.get_attribute('class') or '(none)',
+            'text': element.text[:60] or '(none)',
+            'frame_path': self._format_frame_path(frame_path)
+        }
+
+    def _populate_table_grid(self, dataframe):
+        """Display a DataFrame in the table grid."""
+        self.table_grid.clear()
+        if dataframe is None or dataframe.empty:
+            self.table_grid.setRowCount(0)
+            self.table_grid.setColumnCount(0)
+            return
+
+        self.table_grid.setRowCount(len(dataframe.index))
+        self.table_grid.setColumnCount(len(dataframe.columns))
+        self.table_grid.setHorizontalHeaderLabels([str(col) for col in dataframe.columns])
+
+        for row_index in range(len(dataframe.index)):
+            for col_index, column_name in enumerate(dataframe.columns):
+                full_text = self._normalize_display_text(dataframe.iloc[row_index, col_index])
+                display_text = self._truncate_text(full_text)
+                if display_text != full_text:
+                    display_text = f"{display_text} [Click to expand]"
+                item = QTableWidgetItem(display_text)
+                item.setToolTip(full_text)
+                item.setData(Qt.ItemDataRole.UserRole, full_text)
+                self.table_grid.setItem(row_index, col_index, item)
+
+        self.table_grid.resizeColumnsToContents()
+        if hasattr(self, 'results_tabs') and hasattr(self, 'results_table_tab_index'):
+            self.results_tabs.setCurrentIndex(self.results_table_tab_index)
+
+    def _normalize_display_text(self, value):
+        """Normalize values for display across grid and HTML views."""
+        if not value:
+            return "-"
+        if isinstance(value, list):
+            normalized = " ".join(str(item) for item in value if item)
+            return normalized or "-"
+        return str(value)
+
+    def _truncate_text(self, value, limit=None):
+        """Keep long captured text compact in the UI."""
+        text = self._normalize_display_text(value)
+        max_length = limit or self.preview_text_limit
+        if len(text) <= max_length:
+            return text
+        return f"{text[:max_length].rstrip()}..."
+
+    def _register_expandable_text(self, value):
+        """Store the full text behind an expand link."""
+        text = self._normalize_display_text(value)
+        key = f"text_{len(self.expanded_text_registry) + 1}"
+        self.expanded_text_registry[key] = text
+        return key
+
+    def _format_expandable_html(self, value, label="Text"):
+        """Render long text as a short preview with an expand link."""
+        text = self._normalize_display_text(value)
+        preview = self._truncate_text(text)
+        if preview == text:
+            return html.escape(text)
+
+        key = self._register_expandable_text(text)
+        return (
+            f"{html.escape(preview)} "
+            f"<a href=\"expand:{key}\" style=\"color:#1d4ed8; font-weight:600; text-decoration:none;\">Expand</a>"
+        )
+
+    def _show_expanded_text(self, title, text):
+        """Show the full captured text in a dedicated dialog."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(760, 520)
+
+        layout = QVBoxLayout(dialog)
+        text_view = QTextEdit()
+        text_view.setReadOnly(True)
+        text_view.setPlainText(text)
+        layout.addWidget(text_view)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
+        dialog.exec()
+
+    def _handle_output_link(self, url):
+        """Open long truncated text from the output browser."""
+        url_text = url.toString()
+        if not url_text.startswith("expand:"):
+            return
+
+        key = url_text.split("expand:", 1)[1]
+        full_text = self.expanded_text_registry.get(key)
+        if full_text:
+            self._show_expanded_text("Captured Text", full_text)
+
+    def _handle_table_item_click(self, item):
+        """Open long table cell values when the preview is clicked."""
+        full_text = item.data(Qt.ItemDataRole.UserRole)
+        if not full_text or self._truncate_text(full_text) == full_text:
+            return
+        self._show_expanded_text("Table Cell Text", full_text)
+
+    def _populate_frame_download_list(self, downloads):
+        """Render downloaded frame HTML locations in the list tab."""
+        self.frame_download_list.clear()
+        if not downloads:
+            self.frame_download_list.addItem("No frame HTML downloads yet.")
+            return
+
+        for entry in downloads:
+            label = f"{entry['frame_label']} -> {entry['file_path']}"
+            if entry.get('is_target'):
+                label = f"[Target] {label}"
+            self.frame_download_list.addItem(label)
+
+    def _download_frame_htmls(self, target_frame_path=None):
+        """Download HTML for the main document and all reachable frames, marking the target frame."""
+        if not self.ensure_driver():
+            return []
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        frame_export_dir = os.path.join(self._get_export_directory(), f"frames_{timestamp}")
+        os.makedirs(frame_export_dir, exist_ok=True)
+
+        try:
+            frame_paths = self._collect_frame_paths()
+        except Exception:
+            frame_paths = [[]]
+
+        downloads = []
+        for frame_path in frame_paths:
+            try:
+                self._switch_to_frame_path(frame_path)
+                frame_html = self.driver.page_source
+                frame_label = self._format_frame_path(frame_path)
+                safe_frame_name = self._sanitize_filename_part(frame_label.replace(' > ', '_'), 'main_document')
+                file_path = os.path.join(frame_export_dir, f"{safe_frame_name}.html")
+                with open(file_path, 'w', encoding='utf-8') as file_handle:
+                    file_handle.write(frame_html)
+                downloads.append({
+                    'frame_path': list(frame_path),
+                    'frame_label': frame_label,
+                    'file_path': file_path,
+                    'is_target': list(frame_path) == list(target_frame_path or [])
+                })
+            except Exception:
+                continue
+            finally:
+                self.driver.switch_to.default_content()
+
+        self.last_frame_downloads = downloads
+        self._populate_frame_download_list(downloads)
+        return downloads
+
+    def _find_element_across_frames(self, finder):
+        """Run a finder callback across the main document and nested frames."""
+        try:
+            frame_paths = self._collect_frame_paths()
+        except Exception:
+            frame_paths = [[]]
+
+        for frame_path in frame_paths:
+            try:
+                self._switch_to_frame_path(frame_path)
+                result = finder()
+                if result:
+                    return result, frame_path
+            except Exception:
+                continue
+            finally:
+                self.driver.switch_to.default_content()
+        return None, None
+
+    def search_text_in_html(self, text, html, frame_path='main document'):
+        try:
+            soup = BeautifulSoup(html, 'lxml')
+            matches = []
+            for element in soup.find_all(string=True):
+                if text.lower() in element.lower():
+                    parent = element.parent
+                    context = {
+                        'text': element.strip(),
+                        'tag': parent.name,
+                        'id': parent.get('id'),
+                        'class': parent.get('class'),
+                        'name': parent.get('name'),
+                        'type': parent.get('type'),
+                        'href': parent.get('href'),
+                        'frame_path': frame_path,
+                    }
+                    matches.append(context)
+            return matches
+        except Exception as e:
+            self.output.append(f"Error searching HTML: {str(e)}")
+            return []
+
+    def correct_xpath(self, xpath):
+        """Correct common XPath errors."""
+        corrected = xpath
+        corrected = corrected.replace('""', "'")
+
+        if "[" in corrected and "@" not in corrected:
+            corrected = corrected.replace("[id=", "[@id=")
+            corrected = corrected.replace("[name=", "[@name=")
+            corrected = corrected.replace("[class=", "[@class=")
+
+        if corrected.startswith("/") and not corrected.startswith("//"):
+            corrected = "/" + corrected
+
+        return corrected
+
+    def try_xpath_variants(self, xpath):
+        """Try different XPath variants across the main document and nested frames."""
+        variants = [
+            xpath,
+            self.correct_xpath(xpath),
+        ]
+
+        for variant in variants:
+            element, frame_path = self._find_element_across_frames(
+                lambda variant=variant: self.driver.find_element(By.XPATH, variant)
+            )
+            if element:
+                return element, variant, frame_path
+        return None, None, None
+
+    def _build_analyze_locator_options(self, snapshot, context):
+        """Build locator suggestions for Analyze Locator."""
+        tag = (snapshot.get('tag') or '*').lower()
+        text = (snapshot.get('text') or '').strip()
+        elem_id = (snapshot.get('id') or '').strip()
+        elem_name = (snapshot.get('name') or '').strip()
+        elem_class = (snapshot.get('class') or '').strip()
+        stable_classes = self._stable_class_tokens(elem_class)
+        prev_sibling = context.get('prevSibling') if context else None
+        next_sibling = context.get('nextSibling') if context else None
+
+        options = []
+
+        if text:
+            options.append(f"XPath Text: //{tag}[contains(normalize-space(.),{self._escape_xpath_text(text[:30])})]")
+
+        if elem_id:
+            options.append(f"ID: {elem_id}")
+            options.append(f"CSS ID: #{elem_id}")
+            options.append(f"XPath ID: //{tag}[@id={self._escape_xpath_text(elem_id)}]")
+
+        if elem_name:
+            options.append(f"Name: {elem_name}")
+            options.append(f"XPath Name: //{tag}[@name={self._escape_xpath_text(elem_name)}]")
+
+        if stable_classes:
+            class_conditions = " and ".join(
+                f"contains(@class,{self._escape_xpath_text(class_token)})" for class_token in stable_classes[:2]
+            )
+            options.append(f"CSS Class: .{stable_classes[0]}")
+            options.append(f"CSS Tag.Class: {tag}.{stable_classes[0]}")
+            options.append(f"XPath Class: //{tag}[{class_conditions}]")
+
+        dynamic_candidates = self._build_dynamic_xpath_candidates(context or {})
+        for candidate in dynamic_candidates:
+            if "following-sibling::" in candidate:
+                options.append(f"Stable XPath From Previous Sibling: {candidate}")
+            elif "preceding-sibling::" in candidate:
+                options.append(f"Stable XPath From Next Sibling: {candidate}")
+            else:
+                options.append(f"Stable XPath: {candidate}")
+
+        for option in self._build_locator_result_options(context or {}):
+            options.append(option)
+
+        deduped = []
+        seen = set()
+        for option in options:
+            if option not in seen:
+                deduped.append(option)
+                seen.add(option)
+        return deduped
+
+    def analyze_locator(self):
+        if not self.ensure_driver():
+            return
+
+        locator_input = self.locator_input.text().strip()
+        if not locator_input:
+            self.output.append("Enter a locator or search term")
+            return
+
+        self._set_processing_status(True, "Analyzing locator ...")
+        try:
+            self.bg_color_toggle = not self.bg_color_toggle
+            bg_marker = "[A]" if self.bg_color_toggle else "[B]"
+
+            self.output.append(f"\n{bg_marker} " + "=" * 98)
+            self.output.append(f"ANALYZING: {locator_input}")
+            self.output.append("=" * 100)
+
+            locator_type = "XPath" if locator_input.startswith("//") else "Auto-Detect"
+            attempt_logs = []
+            element, strategy_used, strategy_value_used, frame_path = self.try_locator_with_strategy(
+                locator_input,
+                locator_type,
+                attempt_logs=attempt_logs
+            )
+
+            if element:
+                by_strategy = self.get_locator_strategy(strategy_used, strategy_value_used)
+                if not by_strategy:
+                    self.output.append("Matched element, but could not rebuild locator strategy for analysis.")
+                    self.output.append("=" * 100)
+                    return
+
+                by_type, by_value = by_strategy
+                snapshot, context = self._with_element_in_frame(
+                    by_type,
+                    by_value,
+                    frame_path,
+                    lambda current_element: (
+                        self._get_element_snapshot(current_element),
+                        self._get_element_dom_context(current_element)
+                    ),
+                    timeout=4
+                )
+
+                self.output.append(f"Found via {strategy_used}")
+                if strategy_used == "XPath" and strategy_value_used != locator_input:
+                    self.output.append(f"  (Auto-corrected: {strategy_value_used})")
+
+                self.output.append("\nELEMENT INFO:")
+                self.output.append(f"  Tag: <{snapshot.get('tag') or '-'}>")
+                self.output.append(f"  ID: {snapshot.get('id') or '(none)'}")
+                self.output.append(f"  Name: {snapshot.get('name') or '(none)'}")
+                self.output.append(f"  Class: {snapshot.get('class') or '(none)'}")
+                self.output.append(f"  Text: {(snapshot.get('text') or '(none)')[:60]}")
+                self.output.append(f"  Frame: {self._format_frame_path(frame_path or [])}")
+
+                self.output.append("\nLOCATOR OPTIONS:")
+                locator_options = self._build_analyze_locator_options(snapshot, context)
+                for index, option in enumerate(locator_options, 1):
+                    self.output.append(f"  {index}. {option}")
+
+                self._refresh_frame_downloads_for_match(frame_path)
+                if hasattr(self, 'workspace_tabs') and hasattr(self, 'results_tab_index'):
+                    self.workspace_tabs.setCurrentIndex(self.results_tab_index)
+                self.output.append("=" * 100)
+            else:
+                self.output.append("Element not found in main document or nested iframes. Try with different format.")
+                if hasattr(self, 'workspace_tabs') and hasattr(self, 'results_tab_index'):
+                    self.workspace_tabs.setCurrentIndex(self.results_tab_index)
+                self.output.append("=" * 100)
+        finally:
+            self._set_processing_status(False, "Locator analysis finished")
+
+
+    def enable_element_selection(self):
+        """Enable clicking elements on the page to get locators across frames."""
+        if not self.ensure_driver():
+            return
+
+        self.output.append("\nELEMENT SELECTOR ACTIVATED")
+        self.output.append("=" * 100)
+        self.output.append("Click on any element in the browser to get its locators")
+        self.output.append("The selected element will be highlighted in blue")
+        self.output.append("=" * 100 + "\n")
+
+        js_code = """
+        if (window.elementSelectorActive) {
+            document.removeEventListener('mouseover', window.highlightElement, true);
+            document.removeEventListener('click', window.captureElement, true);
+        }
+
+        window.elementSelectorActive = true;
+        let selectedElement = null;
+        let originalStyle = null;
+
+        window.highlightElement = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            if (selectedElement && originalStyle) {
+                selectedElement.style.outline = originalStyle.outline;
+                selectedElement.style.outlineOffset = originalStyle.outlineOffset;
+                selectedElement.style.backgroundColor = originalStyle.backgroundColor;
+            }
+
+            const target = e.target;
+            if (target !== document && target !== document.body && target !== document.documentElement) {
+                originalStyle = {
+                    outline: target.style.outline,
+                    outlineOffset: target.style.outlineOffset,
+                    backgroundColor: target.style.backgroundColor
+                };
+                target.style.outline = '3px solid blue';
+                target.style.outlineOffset = '2px';
+                target.style.backgroundColor = 'rgba(0, 0, 255, 0.1)';
+                selectedElement = target;
+            }
+        };
+
+        window.captureElement = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const element = e.target;
+            if (element !== document && element !== document.body && element !== document.documentElement) {
+                const tag = element.tagName.toLowerCase();
+                const id = element.getAttribute('id') || null;
+                const className = element.getAttribute('class') || null;
+                const name = element.getAttribute('name') || null;
+                const type = element.getAttribute('type') || null;
+                const text = (element.textContent || '').substring(0, 100).trim();
+                const href = element.getAttribute('href') || null;
+
+                window.selectedElementData = {
+                    tag: tag,
+                    id: id,
+                    class: className,
+                    name: name,
+                    type: type,
+                    text: text,
+                    href: href,
+                    xpath: getXPath(element)
+                };
+            }
+        };
+
+        function getXPath(element) {
+            if (element.id !== '')
+                return "//*[@id='" + element.id + "']";
+            if (element === document.body)
+                return element.tagName.toLowerCase();
+
+            let ix = 0;
+            const siblings = element.parentNode.childNodes;
+            for (let i = 0; i < siblings.length; i++) {
+                const sibling = siblings[i];
+                if (sibling === element)
+                    return getXPath(element.parentNode) + "/" + element.tagName.toLowerCase() + "[" + (ix + 1) + "]";
+                if (sibling.nodeType === 1 && sibling.tagName.toLowerCase() === element.tagName.toLowerCase())
+                    ix++;
+            }
+            return element.tagName.toLowerCase();
+        }
+
+        document.addEventListener('mouseover', window.highlightElement, true);
+        document.addEventListener('click', window.captureElement, true);
+        """
+
+        try:
+            injected_count = 0
+            try:
+                frame_paths = self._collect_frame_paths()
+            except Exception:
+                frame_paths = [[]]
+
+            for frame_path in frame_paths:
+                try:
+                    self._switch_to_frame_path(frame_path)
+                    self.driver.execute_script(js_code)
+                    injected_count += 1
+                except Exception:
+                    continue
+                finally:
+                    self.driver.switch_to.default_content()
+
+            self.output.append(f"Element selector ready in {injected_count} document context(s). Click on an element in the browser...")
+            self._start_element_selection_polling()
+        except Exception as e:
+            self.output.append(f"Failed to enable selector: {str(e)}")
+
+    def _start_element_selection_polling(self):
+        """Poll the browser for a directly clicked element selection."""
+        if self.selection_poll_timer is None:
+            self.selection_poll_timer = QTimer(self)
+            self.selection_poll_timer.timeout.connect(self._poll_selected_element_data)
+        self.selection_poll_timer.start(250)
+
+    def _poll_selected_element_data(self):
+        """Capture the first selected element without requiring a confirmation dialog."""
+        if not self.driver:
+            if self.selection_poll_timer:
+                self.selection_poll_timer.stop()
+            return
+
+        try:
+            element_data = None
+            selected_frame_path = []
+            try:
+                frame_paths = self._collect_frame_paths()
+            except Exception:
+                frame_paths = [[]]
+
+            for frame_path in frame_paths:
+                try:
+                    self._switch_to_frame_path(frame_path)
+                    frame_element_data = self.driver.execute_script("return window.selectedElementData || null;")
+                    if frame_element_data:
+                        element_data = frame_element_data
+                        selected_frame_path = list(frame_path)
+                        break
+                except Exception:
+                    continue
+                finally:
+                    self.driver.switch_to.default_content()
+
+            if not element_data:
+                return
+
+            if self.selection_poll_timer:
+                self.selection_poll_timer.stop()
+            self._apply_selected_element_data(element_data, selected_frame_path)
+        except Exception as e:
+            if self.selection_poll_timer:
+                self.selection_poll_timer.stop()
+            self.output.append(f"Failed to capture selected element: {str(e)}")
+            self.cleanup_element_selector()
+
+    def _apply_selected_element_data(self, element_data, selected_frame_path):
+        """Render the clicked element details and push the primary XPath into the tester."""
+        self.bg_color_toggle = not self.bg_color_toggle
+        bg_marker = "[A]" if self.bg_color_toggle else "[B]"
+
+        self.output.append(f"\n{bg_marker} " + "=" * 98)
+        self.output.append("ELEMENT SELECTED")
+        self.output.append("=" * 100)
+
+        self.output.append("\nELEMENT INFO:")
+        self.output.append(f"  Tag: <{element_data['tag']}>")
+        if element_data['id']:
+            self.output.append(f"  ID: {element_data['id']}")
+        if element_data['class']:
+            self.output.append(f"  Class: {element_data['class']}")
+        if element_data['name']:
+            self.output.append(f"  Name: {element_data['name']}")
+        if element_data['type']:
+            self.output.append(f"  Type: {element_data['type']}")
+        if element_data['text']:
+            self.output.append(f"  Text: {element_data['text'][:60]}")
+        if element_data['href']:
+            self.output.append(f"  Href: {element_data['href']}")
+        self.output.append(f"  Frame: {self._format_frame_path(selected_frame_path)}")
+
+        self.output.append("\nLOCATOR OPTIONS:")
+        locators = []
+
+        if element_data['xpath']:
+            locators.append(f"  1. XPath: {element_data['xpath']}")
+        if element_data['text']:
+            locators.append(f"  2. XPath Text: //{element_data['tag']}[contains(text(),'{element_data['text'][:30]}')]")
+        if element_data['id']:
+            locators.append(f"  3. ID: {element_data['id']}")
+            locators.append(f"  4. CSS ID: #{element_data['id']}")
+        if element_data['name']:
+            locators.append(f"  5. Name: {element_data['name']}")
+        if element_data['class']:
+            first_class = element_data['class'].split()[0]
+            locators.append(f"  6. CSS Class: .{first_class}")
+            locators.append(f"  7. CSS Tag.Class: {element_data['tag']}.{first_class}")
+        if element_data['type']:
+            locators.append(f"  8. Type: [{element_data['type']}]")
+        if element_data['href']:
+            locators.append(f"  9. Link: a[href='{element_data['href']}']")
+
+        seen = set()
+        for locator in locators:
+            if locator not in seen:
+                self.output.append(locator)
+                seen.add(locator)
+
+        if element_data.get('xpath'):
+            self.test_locator_input.setText(element_data['xpath'])
+            self.locator_type_combo.setCurrentText("XPath")
+            self.test_result_display.setText(
+                f"Selected element loaded into Locator Tester.\n\nXPath: {element_data['xpath']}\nFrame: {self._format_frame_path(selected_frame_path)}"
+            )
+            if hasattr(self, 'workspace_tabs') and hasattr(self, 'tester_tab_index'):
+                self.workspace_tabs.setCurrentIndex(self.tester_tab_index)
+
+        self.output.append("=" * 100)
+        self.output.append("Element was captured directly and loaded into the Locator Tester")
+        self.cleanup_element_selector()
+
+    def show_element_selector_dialog(self):
+        """Show a dialog to wait for element selection."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Element Selector")
+        dialog.setGeometry(100, 100, 400, 150)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Click on an element in the browser window"))
+        layout.addWidget(QLabel("The element will be captured when you click it"))
+
+        button_layout = QHBoxLayout()
+
+        capture_btn = QPushButton("Get Locators")
+        capture_btn.clicked.connect(lambda: self.capture_selected_element(dialog))
+        button_layout.addWidget(capture_btn)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(lambda: self.cancel_element_selection(dialog))
+        button_layout.addWidget(cancel_btn)
+
+        layout.addLayout(button_layout)
+        dialog.setLayout(layout)
+        dialog.exec()
+
+    def capture_selected_element(self, dialog):
+        """Get the selected element data and show locators."""
+        try:
+            element_data = None
+            selected_frame_path = []
+            try:
+                frame_paths = self._collect_frame_paths()
+            except Exception:
+                frame_paths = [[]]
+
+            for frame_path in frame_paths:
+                try:
+                    self._switch_to_frame_path(frame_path)
+                    frame_element_data = self.driver.execute_script("return window.selectedElementData || null;")
+                    if frame_element_data:
+                        element_data = frame_element_data
+                        selected_frame_path = list(frame_path)
+                        break
+                except Exception:
+                    continue
+                finally:
+                    self.driver.switch_to.default_content()
+
+            if not element_data:
+                QMessageBox.warning(self, "No Element", "Please click on an element first!")
+                return
+
+            dialog.close()
+
+            self.bg_color_toggle = not self.bg_color_toggle
+            bg_marker = "[A]" if self.bg_color_toggle else "[B]"
+
+            self.output.append(f"\n{bg_marker} " + "=" * 98)
+            self.output.append("ELEMENT SELECTED")
+            self.output.append("=" * 100)
+
+            self.output.append("\nELEMENT INFO:")
+            self.output.append(f"  Tag: <{element_data['tag']}>")
+            if element_data['id']:
+                self.output.append(f"  ID: {element_data['id']}")
+            if element_data['class']:
+                self.output.append(f"  Class: {element_data['class']}")
+            if element_data['name']:
+                self.output.append(f"  Name: {element_data['name']}")
+            if element_data['type']:
+                self.output.append(f"  Type: {element_data['type']}")
+            if element_data['text']:
+                self.output.append(f"  Text: {element_data['text'][:60]}")
+            if element_data['href']:
+                self.output.append(f"  Href: {element_data['href']}")
+            self.output.append(f"  Frame: {self._format_frame_path(selected_frame_path)}")
+
+            self.output.append("\nLOCATOR OPTIONS:")
+            locators = []
+
+            if element_data['xpath']:
+                locators.append(f"  1. XPath: {element_data['xpath']}")
+            if element_data['text']:
+                locators.append(f"  2. XPath Text: //{element_data['tag']}[contains(text(),'{element_data['text'][:30]}')]")
+            if element_data['id']:
+                locators.append(f"  3. ID: {element_data['id']}")
+                locators.append(f"  4. CSS ID: #{element_data['id']}")
+            if element_data['name']:
+                locators.append(f"  5. Name: {element_data['name']}")
+            if element_data['class']:
+                first_class = element_data['class'].split()[0]
+                locators.append(f"  6. CSS Class: .{first_class}")
+                locators.append(f"  7. CSS Tag.Class: {element_data['tag']}.{first_class}")
+            if element_data['type']:
+                locators.append(f"  8. Type: [{element_data['type']}]")
+            if element_data['href']:
+                locators.append(f"  9. Link: a[href='{element_data['href']}']")
+
+            seen = set()
+            for locator in locators:
+                if locator not in seen:
+                    self.output.append(locator)
+                    seen.add(locator)
+
+            self.output.append("=" * 100)
+            self.output.append("You can now copy any locator above to use in your tests")
+            self.cleanup_element_selector()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to capture element: {str(e)}")
+            self.cleanup_element_selector()
+
+    def cancel_element_selection(self, dialog):
+        """Cancel element selection."""
+        dialog.close()
+        self.cleanup_element_selector()
+        self.output.append("Element selection cancelled")
+
+    def cleanup_element_selector(self):
+        """Remove element selector from the main document and reachable frames."""
+        try:
+            if self.selection_poll_timer:
+                self.selection_poll_timer.stop()
+            cleanup_js = """
+            if (window.elementSelectorActive) {
+                document.removeEventListener('mouseover', window.highlightElement, true);
+                document.removeEventListener('click', window.captureElement, true);
+                window.elementSelectorActive = false;
+                window.selectedElementData = null;
+            }
+            """
+            try:
+                frame_paths = self._collect_frame_paths()
+            except Exception:
+                frame_paths = [[]]
+            for frame_path in frame_paths:
+                try:
+                    self._switch_to_frame_path(frame_path)
+                    self.driver.execute_script(cleanup_js)
+                except Exception:
+                    continue
+                finally:
+                    self.driver.switch_to.default_content()
+        except Exception:
+            pass
+
+    def _escape_xpath_text(self, value):
+        """Escape text for safe XPath string usage."""
+        if value is None:
+            return "''"
+        if "'" not in value:
+            return f"'{value}'"
+        if '"' not in value:
+            return f'"{value}"'
+        parts = value.split("'")
+        return "concat(" + ", \"'\", ".join(f"'{part}'" for part in parts) + ")"
+
+    def _is_dynamic_token(self, token):
+        """Heuristic check for tokens that likely contain dynamic identifiers."""
+        if not token:
+            return False
+        token = str(token).strip()
+        return (
+            len(token) > 10 and bool(re.search(r'\d', token)) and bool(re.search(r'[A-Za-z]', token))
+        ) or bool(re.search(r'[0-9]{3,}', token))
+
+    def _stable_class_tokens(self, class_value):
+        """Return class tokens that are more likely to be stable."""
+        if not class_value:
+            return []
+        tokens = class_value if isinstance(class_value, list) else str(class_value).split()
+        stable_tokens = []
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+            if self._is_dynamic_token(token):
+                continue
+            stable_tokens.append(token)
+        return stable_tokens[:3]
+
+    def _append_attempt_log(self, logs, message):
+        """Append a formatted attempt message."""
+        if logs is not None:
+            logs.append(message)
+
+    def _build_strategy_list(self, locator_value, locator_type):
+        """Build the strategies to try for the given locator."""
+        if locator_type == "Auto-Detect":
+            return [
+                ("XPath", locator_value if locator_value.startswith("//") else f"//*[contains(normalize-space(.),{self._escape_xpath_text(locator_value)})]"),
+                ("ID", locator_value),
+                ("CSS Selector", locator_value),
+                ("Name", locator_value),
+                ("Text (Contains)", locator_value),
+            ]
+        return [(locator_type, locator_value)]
+
+    def _find_element_in_frames_with_wait(self, by_type, by_value, timeout=4):
+        """Find an element across frames with a small explicit wait."""
+        try:
+            frame_paths = self._collect_frame_paths()
+        except Exception:
+            frame_paths = [[]]
+
+        for frame_path in frame_paths:
+            try:
+                self._switch_to_frame_path(frame_path)
+                wait = WebDriverWait(self.driver, timeout)
+                element = wait.until(lambda driver: driver.find_element(by_type, by_value))
+                if element:
+                    return element, frame_path
+            except Exception:
+                continue
+            finally:
+                self.driver.switch_to.default_content()
+        return None, None
+
+    def _get_element_snapshot(self, element):
+        """Capture element details without keeping a live reference for later UI use."""
+        snapshot = {
+            'tag': '',
+            'id': '',
+            'class': '',
+            'text': '',
+            'value': '',
+            'name': '',
+            'type': '',
+            'selected_texts': [],
+        }
+        try:
+            snapshot['tag'] = element.tag_name or ''
+        except Exception:
+            pass
+        for attr in ('id', 'class', 'value', 'name', 'type'):
+            try:
+                snapshot[attr] = element.get_attribute(attr) or ''
+            except Exception:
+                snapshot[attr] = ''
+        try:
+            snapshot['text'] = (element.text or '')[:120]
+        except Exception:
+            snapshot['text'] = ''
+        try:
+            if (snapshot['tag'] or '').lower() == 'select':
+                select = Select(element)
+                snapshot['selected_texts'] = [opt.text.strip() for opt in select.all_selected_options if opt.text.strip()]
+        except Exception:
+            snapshot['selected_texts'] = []
+        return snapshot
+
+    def _locate_element_in_frame(self, by_type, by_value, frame_path, timeout=4):
+        """Locate an element while already scoped to a specific frame path."""
+        self._switch_to_frame_path(frame_path or [])
+        wait = WebDriverWait(self.driver, timeout)
+        return wait.until(lambda driver: driver.find_element(by_type, by_value))
+
+    def _with_element_in_frame(self, by_type, by_value, frame_path, callback, timeout=4):
+        """Run a callback with a fresh element inside its frame and always restore default content."""
+        try:
+            element = self._locate_element_in_frame(by_type, by_value, frame_path, timeout=timeout)
+            return callback(element)
+        finally:
+            self.driver.switch_to.default_content()
+
+    def _locate_with_strategies(self, strategies_to_try, attempt_logs=None, timeout=4):
+        """Try a list of locator strategies and log each attempt."""
+        for strategy_name, strategy_value in strategies_to_try:
+            self._append_attempt_log(attempt_logs, f"Trying locator option: [{strategy_name}] {strategy_value}")
+            try:
+                by_strategy = self.get_locator_strategy(strategy_name, strategy_value)
+                if not by_strategy:
+                    self._append_attempt_log(attempt_logs, f"Skipped unsupported strategy: {strategy_name}")
+                    continue
+
+                by_type, by_value = by_strategy
+                element, frame_path = self._find_element_in_frames_with_wait(by_type, by_value, timeout=timeout)
+                if element:
+                    self._append_attempt_log(
+                        attempt_logs,
+                        f"SUCCESS with locator option: [{strategy_name}] in {self._format_frame_path(frame_path or [])}"
+                    )
+                    return element, strategy_name, strategy_value, frame_path
+                self._append_attempt_log(attempt_logs, f"No match for option: [{strategy_name}]")
+            except Exception as e:
+                self._append_attempt_log(attempt_logs, f"Option failed: [{strategy_name}] - {str(e)}")
+        return None, None, None, None
+
+    def _looks_like_dropdown_element(self, element):
+        """Best-effort detection for dropdown or option elements."""
+        try:
+            tag = (element.tag_name or '').lower()
+            role = (element.get_attribute('role') or '').lower()
+            aria_haspopup = (element.get_attribute('aria-haspopup') or '').lower()
+            classes = (element.get_attribute('class') or '').lower()
+            multiple = element.get_attribute('multiple')
+            return (
+                tag in ('select', 'option')
+                or role in ('combobox', 'listbox', 'option', 'menuitem')
+                or aria_haspopup in ('listbox', 'menu', 'true')
+                or any(keyword in classes for keyword in ('dropdown', 'select', 'menu', 'option', 'combo'))
+                or multiple is not None
+            )
+        except Exception:
+            return False
+
+    def _open_dropdown_if_needed(self, element, attempt_logs=None, force_dropdown=False):
+        """Open a dropdown-like control and wait briefly for options to become available."""
+        if not (force_dropdown or self.dropdown_toggle.isChecked() or self._looks_like_dropdown_element(element)):
+            return
+
+        self._append_attempt_log(attempt_logs, "Dropdown handling enabled. Attempting to open option container.")
+        try:
+            tag = (element.tag_name or '').lower()
+            if tag == 'option':
+                self._append_attempt_log(attempt_logs, "Target is a native <option>; parent <select> will handle selection.")
+                return
+
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+            try:
+                element.click()
+                self._append_attempt_log(attempt_logs, "Dropdown trigger clicked directly.")
+            except Exception:
+                self.driver.execute_script("arguments[0].click();", element)
+                self._append_attempt_log(attempt_logs, "Dropdown trigger clicked with JavaScript fallback.")
+
+            if self.wait_for_options_toggle.isChecked():
+                WebDriverWait(self.driver, 3).until(
+                    lambda driver: len(driver.find_elements(By.XPATH, "//option|//*[@role='option']")) > 0
+                )
+                self._append_attempt_log(attempt_logs, "Option list appeared after waiting.")
+        except Exception as e:
+            self._append_attempt_log(attempt_logs, f"Dropdown open attempt did not confirm options: {str(e)}")
+
+    def _extract_value_from_element(self, element, attempt_logs=None):
+        """Return the most useful value representation for a matched element."""
+        snapshot = self._get_element_snapshot(element)
+        tag = (snapshot.get('tag') or '').lower()
+
+        if tag == 'select':
+            selected_texts = snapshot.get('selected_texts') or []
+            if selected_texts:
+                self._append_attempt_log(attempt_logs, f"Read selected option text: {', '.join(selected_texts)}")
+                return ", ".join(selected_texts), snapshot
+
+        value = snapshot.get('value') or ''
+        if value:
+            self._append_attempt_log(attempt_logs, f"Read value attribute: {value}")
+            return value, snapshot
+
+        text = snapshot.get('text') or ''
+        if text:
+            self._append_attempt_log(attempt_logs, f"Read visible text: {text}")
+            return text, snapshot
+
+        self._append_attempt_log(attempt_logs, "Element did not expose a value or visible text.")
+        return "", snapshot
+
+    def _extract_table_context(self, element):
+        """Extract the nearest table around the current element, if one exists."""
+        script = """
+        const element = arguments[0];
+
+        function stableClasses(node) {
+            if (!node) return [];
+            return (node.className || '')
+                .split(/\\s+/)
+                .map(token => token.trim())
+                .filter(token => token && !(/[0-9]{3,}/.test(token) || (token.length > 10 && /[A-Za-z]/.test(token) && /\\d/.test(token))))
+                .slice(0, 3);
+        }
+
+        function cleanText(value) {
+            return (value || '').replace(/\\s+/g, ' ').trim();
+        }
+
+        function getElementText(node) {
+            return cleanText(node ? (node.innerText || node.textContent || '') : '');
+        }
+
+        function buildXPath(node) {
+            if (!node) return '';
+            if (node.id) {
+                return `//${node.tagName.toLowerCase()}[@id="${node.id}"]`;
+            }
+
+            const path = [];
+            let current = node;
+            while (current && current.nodeType === 1) {
+                let index = 1;
+                let sibling = current.previousElementSibling;
+                while (sibling) {
+                    if (sibling.tagName === current.tagName) {
+                        index += 1;
+                    }
+                    sibling = sibling.previousElementSibling;
+                }
+                path.unshift(`${current.tagName.toLowerCase()}[${index}]`);
+                current = current.parentElement;
+                if (current && current.tagName && current.tagName.toLowerCase() === 'html') {
+                    path.unshift('html[1]');
+                    break;
+                }
+            }
+            return '/' + path.join('/');
+        }
+
+        function getCellText(cell) {
+            return getElementText(cell);
+        }
+
+        function reconstructRows(table) {
+            const sourceRows = Array.from(table.querySelectorAll('tr'));
+            const grid = [];
+            const activeSpans = [];
+
+            sourceRows.forEach((row, rowIndex) => {
+                if (!grid[rowIndex]) {
+                    grid[rowIndex] = [];
+                }
+
+                let columnIndex = 0;
+                while (activeSpans[columnIndex] && activeSpans[columnIndex].remaining > 0) {
+                    grid[rowIndex][columnIndex] = activeSpans[columnIndex].text;
+                    activeSpans[columnIndex].remaining -= 1;
+                    if (activeSpans[columnIndex].remaining <= 0) {
+                        activeSpans[columnIndex] = null;
+                    }
+                    columnIndex += 1;
+                }
+
+                const cells = Array.from(row.children).filter(cell => {
+                    const tag = (cell.tagName || '').toLowerCase();
+                    return tag === 'th' || tag === 'td';
+                });
+
+                cells.forEach(cell => {
+                    while (grid[rowIndex][columnIndex] !== undefined) {
+                        columnIndex += 1;
+                    }
+
+                    const text = getCellText(cell);
+                    const rowSpan = parseInt(cell.getAttribute('rowspan') || '1', 10);
+                    const colSpan = parseInt(cell.getAttribute('colspan') || '1', 10);
+
+                    for (let colOffset = 0; colOffset < colSpan; colOffset += 1) {
+                        grid[rowIndex][columnIndex + colOffset] = text;
+                        if (rowSpan > 1) {
+                            activeSpans[columnIndex + colOffset] = {
+                                text: text,
+                                remaining: rowSpan - 1
+                            };
+                        }
+                    }
+                    columnIndex += colSpan;
+
+                    while (activeSpans[columnIndex] && activeSpans[columnIndex].remaining > 0) {
+                        grid[rowIndex][columnIndex] = activeSpans[columnIndex].text;
+                        activeSpans[columnIndex].remaining -= 1;
+                        if (activeSpans[columnIndex].remaining <= 0) {
+                            activeSpans[columnIndex] = null;
+                        }
+                        columnIndex += 1;
+                    }
+                });
+            });
+
+            return grid
+                .map(row => row.map(cell => cleanText(cell || '')))
+                .filter(row => row.some(cell => cell));
+        }
+
+        function getCandidateTables(node) {
+            const candidates = [];
+            const seen = new Set();
+            let current = node;
+
+            while (current && current.nodeType === 1) {
+                let scopedTables = [];
+                const tag = (current.tagName || '').toLowerCase();
+                if (tag === 'table') {
+                    scopedTables.push(current);
+                }
+                scopedTables = scopedTables.concat(Array.from(current.querySelectorAll('table, [role="table"], [role="grid"]')));
+                scopedTables.forEach(table => {
+                    if (!seen.has(table)) {
+                        seen.add(table);
+                        candidates.push(table);
+                    }
+                });
+                current = current.parentElement;
+            }
+            return candidates;
+        }
+
+        function scoreTable(table, targetText) {
+            const rows = reconstructRows(table);
+            const tableText = getElementText(table);
+            let score = 0;
+            if (table.contains(element)) {
+                score += 100;
+            }
+            if (targetText && tableText.includes(targetText)) {
+                score += 20;
+            }
+            if (rows.some(row => row.some(cell => targetText && cell.includes(targetText)))) {
+                score += 40;
+            }
+            score += Math.min(rows.length, 20);
+            return { table, rows, score };
+        }
+
+        const targetText = getElementText(element);
+        const candidateTables = getCandidateTables(element)
+            .map(table => scoreTable(table, targetText))
+            .sort((a, b) => b.score - a.score);
+
+        if (!candidateTables.length || candidateTables[0].score <= 0) {
+            return null;
+        }
+
+        const table = candidateTables[0].table;
+        const rows = candidateTables[0].rows;
+
+        let headers = [];
+        const headerCells = table.querySelectorAll('thead th');
+        if (headerCells.length) {
+            headers = Array.from(headerCells).map(cell => cleanText(cell.innerText || cell.textContent));
+        } else if (rows.length > 0) {
+            headers = rows[0];
+        }
+
+        const stableTableClasses = stableClasses(table);
+        const classXPath = stableTableClasses.length
+            ? `//${table.tagName.toLowerCase()}[` + stableTableClasses.map(token => `contains(@class,"${token}")`).join(' and ') + `]`
+            : '';
+
+        return {
+            tag: (table.tagName || '').toLowerCase(),
+            id: table.id || '',
+            classes: stableTableClasses,
+            xpath: buildXPath(table),
+            class_xpath: classXPath,
+            headers: headers,
+            rows: rows,
+            row_count: rows.length,
+            column_count: rows.reduce((maxCols, row) => Math.max(maxCols, row.length), 0),
+            anchor_text: targetText
+        };
+        """
+        return self.driver.execute_script(script, element)
+
+    def _table_context_to_dataframe(self, table_context):
+        """Convert extracted table context into a pandas DataFrame."""
+        rows = table_context.get('rows') or []
+        headers = table_context.get('headers') or []
+        if not rows:
+            return pd.DataFrame()
+
+        data_rows = rows
+        if headers and rows and headers == rows[0]:
+            data_rows = rows[1:]
+
+        max_cols = max(len(row) for row in rows) if rows else 0
+        normalized_rows = [row + [''] * (max_cols - len(row)) for row in data_rows]
+
+        if headers and len(headers) == max_cols:
+            columns = headers
+        else:
+            columns = [f"Column {index}" for index in range(1, max_cols + 1)]
+
+        return pd.DataFrame(normalized_rows, columns=columns)
+
+    def _render_table_extraction_report(self, locator_value, frame_path, table_context, dataframe):
+        """Render extracted table information and content as HTML."""
+        info_rows = [
+            ("Locator", locator_value),
+            ("Frame", self._format_frame_path(frame_path or [])),
+            ("Anchor Text", table_context.get('anchor_text') or '-'),
+            ("Table XPath", table_context.get('xpath') or '-'),
+            ("Table Class XPath", table_context.get('class_xpath') or '-'),
+            ("Table ID", table_context.get('id') or '-'),
+            ("Rows", str(table_context.get('row_count') or 0)),
+            ("Columns", str(table_context.get('column_count') or 0)),
+        ]
+
+        info_html = ''.join(
+            f"<tr><th style=\"text-align:left; padding:8px; border:1px solid #cbd5e1; background:#eff6ff;\">{html.escape(label)}</th>"
+            f"<td style=\"padding:8px; border:1px solid #cbd5e1;\">{html.escape(value)}</td></tr>"
+            for label, value in info_rows
+        )
+
+        if dataframe.empty:
+            table_html = "<p style=\"margin: 12px 0 0 0;\">No table rows were extracted.</p>"
+        else:
+            preview_dataframe = dataframe.applymap(lambda value: self._truncate_text(value))
+            table_html = preview_dataframe.to_html(index=False, border=0, classes="table-extract")
+
+        return f"""
+        <div style="font-family: 'Segoe UI', sans-serif; color: #0f172a; background: #f8fbff; padding: 16px;">
+            <h2 style="margin: 0 0 12px 0;">Extracted Table</h2>
+            <p style="margin: 0 0 12px 0; color: #475569;">Long text is limited to the first {self.preview_text_limit} characters in this view. Use the Table Grid tab to expand a cell.</p>
+            <table style="width: 100%; border-collapse: collapse; margin-bottom: 16px;">
+                <tbody>{info_html}</tbody>
+            </table>
+            <div style="overflow-x: auto;">
+                {table_html}
+            </div>
+        </div>
+        """
+
+    def _maybe_extract_table_for_locator(self, locator_value, frame_path, snapshot, table_context, attempt_logs=None):
+        """Persist the nearest table as a DataFrame and render it when appropriate."""
+        if not table_context:
+            self._append_attempt_log(attempt_logs, "No ancestor table was found for the matched element.")
+            return None
+
+        tag = (snapshot.get('tag') or '').lower()
+        should_extract = self.table_toggle.isChecked() or tag == 'select'
+        if not should_extract:
+            self._append_attempt_log(attempt_logs, "Table detected, but extraction was not forced and target is not a <select>.")
+            return None
+
+        dataframe = self._table_context_to_dataframe(table_context)
+        self.last_extracted_table_df = dataframe
+        self.last_extracted_table_html = self._render_table_extraction_report(locator_value, frame_path, table_context, dataframe)
+        self._populate_table_grid(dataframe)
+        self.output.setHtml(self.last_extracted_table_html)
+        self._append_attempt_log(
+            attempt_logs,
+            f"Extracted table into DataFrame with shape {dataframe.shape[0]}x{dataframe.shape[1]}."
+        )
+        return dataframe
+
+    def _refresh_frame_downloads_for_match(self, frame_path, attempt_logs=None):
+        """Download and list HTML for all current frames, highlighting the matched frame."""
+        downloads = self._download_frame_htmls(target_frame_path=frame_path)
+        if downloads:
+            self._append_attempt_log(attempt_logs, f"Downloaded HTML for {len(downloads)} frame location(s).")
+        else:
+            self._append_attempt_log(attempt_logs, "No frame HTML files were downloaded.")
+        return downloads
+
+    def _click_element_with_fallback(self, element, attempt_logs=None, force_dropdown=False):
+        """Click or select an element with dropdown-aware fallbacks."""
+        try:
+            target = element
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
+            self._open_dropdown_if_needed(target, attempt_logs, force_dropdown=force_dropdown)
+
+            tag = (target.tag_name or '').lower()
+            if tag == 'option':
+                parent = target.find_element(By.XPATH, "./parent::*")
+                if parent.tag_name.lower() == 'select':
+                    option_text = (target.text or '').strip()
+                    if option_text:
+                        Select(parent).select_by_visible_text(option_text)
+                        self._append_attempt_log(attempt_logs, f"Selected native option by visible text: {option_text}")
+                        return True, "native select"
+                    option_value = target.get_attribute('value')
+                    if option_value:
+                        Select(parent).select_by_value(option_value)
+                        self._append_attempt_log(attempt_logs, f"Selected native option by value: {option_value}")
+                        return True, "native select"
+
+            try:
+                WebDriverWait(self.driver, 3).until(lambda driver: target.is_enabled())
+            except Exception:
+                pass
+
+            try:
+                target.click()
+                self._append_attempt_log(attempt_logs, "Clicked target directly.")
+                return True, "direct click"
+            except Exception as click_error:
+                self._append_attempt_log(attempt_logs, f"Direct click failed: {str(click_error)}")
+
+            try:
+                ActionChains(self.driver).move_to_element(target).pause(0.2).click(target).perform()
+                self._append_attempt_log(attempt_logs, "Clicked target using ActionChains.")
+                return True, "action chains"
+            except Exception as action_error:
+                self._append_attempt_log(attempt_logs, f"ActionChains click failed: {str(action_error)}")
+
+            self.driver.execute_script("arguments[0].click();", target)
+            self._append_attempt_log(attempt_logs, "Clicked target using JavaScript fallback.")
+            return True, "javascript click"
+        except Exception as e:
+            self._append_attempt_log(attempt_logs, f"Click flow failed: {str(e)}")
+            return False, "failed"
+
+    def _get_element_dom_context(self, element):
+        """Collect DOM context for generating stable XPath candidates."""
+        script = """
+        const element = arguments[0];
+
+        function firstUsefulText(node) {
+            if (!node) return '';
+            const text = (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+            return text.slice(0, 80);
+        }
+
+        function stableClasses(node) {
+            if (!node) return [];
+            return (node.className || '')
+                .split(/\\s+/)
+                .map(token => token.trim())
+                .filter(token => token && !(/[0-9]{3,}/.test(token) || (token.length > 10 && /[A-Za-z]/.test(token) && /\\d/.test(token))))
+                .slice(0, 3);
+        }
+
+        function siblingInfo(node, direction) {
+            let current = direction === 'prev' ? node.previousElementSibling : node.nextElementSibling;
+            while (current) {
+                const text = firstUsefulText(current);
+                const classes = stableClasses(current);
+                if (text || classes.length || current.id || current.getAttribute('name')) {
+                    return {
+                        tag: (current.tagName || '').toLowerCase(),
+                        text: text,
+                        classes: classes,
+                        id: current.id || '',
+                        name: current.getAttribute('name') || ''
+                    };
+                }
+                current = direction === 'prev' ? current.previousElementSibling : current.nextElementSibling;
+            }
+            return null;
+        }
+
+        let ancestors = [];
+        let parent = element.parentElement;
+        while (parent && ancestors.length < 4) {
+            const classes = stableClasses(parent);
+            const text = firstUsefulText(parent);
+            if (classes.length || parent.id || parent.getAttribute('name')) {
+                ancestors.push({
+                    tag: (parent.tagName || '').toLowerCase(),
+                    classes: classes,
+                    id: parent.id || '',
+                    name: parent.getAttribute('name') || '',
+                    text: text
+                });
+            }
+            parent = parent.parentElement;
+        }
+
+        return {
+            tag: (element.tagName || '').toLowerCase(),
+            id: element.id || '',
+            name: element.getAttribute('name') || '',
+            type: element.getAttribute('type') || '',
+            role: element.getAttribute('role') || '',
+            text: firstUsefulText(element),
+            classes: stableClasses(element),
+            ancestors: ancestors,
+            prevSibling: siblingInfo(element, 'prev'),
+            nextSibling: siblingInfo(element, 'next'),
+            ariaLabel: element.getAttribute('aria-label') || '',
+            placeholder: element.getAttribute('placeholder') || ''
+        };
+        """
+        return self.driver.execute_script(script, element)
+
+    def _build_dynamic_xpath_candidates(self, context):
+        """Generate stable XPath candidates using multiple anchoring techniques."""
+        tag = context.get('tag') or '*'
+        text = (context.get('text') or '').strip()
+        name = (context.get('name') or '').strip()
+        role = (context.get('role') or '').strip()
+        elem_type = (context.get('type') or '').strip()
+        aria_label = (context.get('ariaLabel') or '').strip()
+        placeholder = (context.get('placeholder') or '').strip()
+        elem_id = (context.get('id') or '').strip()
+        target_classes = context.get('classes') or []
+        ancestors = context.get('ancestors') or []
+        prev_sibling = context.get('prevSibling')
+        next_sibling = context.get('nextSibling')
+
+        candidates = []
+
+        if elem_id and not self._is_dynamic_token(elem_id):
+            candidates.append(f"//{tag}[@id={self._escape_xpath_text(elem_id)}]")
+        if name:
+            candidates.append(f"//{tag}[@name={self._escape_xpath_text(name)}]")
+        if aria_label:
+            candidates.append(f"//{tag}[@aria-label={self._escape_xpath_text(aria_label)}]")
+        if placeholder:
+            candidates.append(f"//{tag}[@placeholder={self._escape_xpath_text(placeholder)}]")
+        if role:
+            candidates.append(f"//{tag}[@role={self._escape_xpath_text(role)}]")
+        if elem_type:
+            candidates.append(f"//{tag}[@type={self._escape_xpath_text(elem_type)}]")
+        if role and text:
+            candidates.append(
+                f"//{tag}[@role={self._escape_xpath_text(role)} and contains(normalize-space(.),{self._escape_xpath_text(text[:40])})]"
+            )
+        if text:
+            text_sample = text[:40]
+            candidates.append(f"//{tag}[contains(normalize-space(.),{self._escape_xpath_text(text_sample)})]")
+            candidates.append(
+                f"//{tag}[contains(normalize-space(string(.)),{self._escape_xpath_text(text_sample)})]"
+            )
+        if target_classes:
+            class_conditions = " and ".join(
+                f"contains(concat(' ', normalize-space(@class), ' '), {self._escape_xpath_text(f' {class_token} ')})"
+                for class_token in target_classes[:2]
+            )
+            candidates.append(f"//{tag}[{class_conditions}]")
+
+        for ancestor in ancestors[:2]:
+            ancestor_conditions = []
+            if ancestor.get('id') and not self._is_dynamic_token(ancestor.get('id')):
+                ancestor_conditions.append(f"@id={self._escape_xpath_text(ancestor['id'])}")
+            for class_token in ancestor.get('classes', []):
+                ancestor_conditions.append(
+                    f"contains(concat(' ', normalize-space(@class), ' '), {self._escape_xpath_text(f' {class_token} ')})"
+                )
+            if ancestor.get('name'):
+                ancestor_conditions.append(f"@name={self._escape_xpath_text(ancestor['name'])}")
+            if ancestor.get('text'):
+                ancestor_conditions.append(
+                    f"contains(normalize-space(string(.)),{self._escape_xpath_text(ancestor['text'][:30])})"
+                )
+            if not ancestor_conditions:
+                continue
+
+            ancestor_xpath = f"//{ancestor.get('tag') or '*'}[" + " and ".join(ancestor_conditions[:3]) + "]"
+            target_conditions = []
+            if name:
+                target_conditions.append(f"@name={self._escape_xpath_text(name)}")
+            for class_token in target_classes:
+                target_conditions.append(
+                    f"contains(concat(' ', normalize-space(@class), ' '), {self._escape_xpath_text(f' {class_token} ')})"
+                )
+            if text:
+                target_conditions.append(f"contains(normalize-space(.),{self._escape_xpath_text(text[:40])})")
+            if aria_label:
+                target_conditions.append(f"@aria-label={self._escape_xpath_text(aria_label)}")
+            if role:
+                target_conditions.append(f"@role={self._escape_xpath_text(role)}")
+
+            if target_conditions:
+                candidates.append(f"{ancestor_xpath}//{tag}[" + " and ".join(target_conditions[:3]) + "]")
+                candidates.append(f"{ancestor_xpath}/descendant::{tag}[" + " and ".join(target_conditions[:3]) + "][1]")
+
+            if prev_sibling:
+                prev_conditions = []
+                if prev_sibling.get('text'):
+                    prev_conditions.append(
+                        f"contains(normalize-space(.),{self._escape_xpath_text(prev_sibling['text'][:30])})"
+                    )
+                for class_token in prev_sibling.get('classes', []):
+                    prev_conditions.append(f"contains(@class,{self._escape_xpath_text(class_token)})")
+                if prev_sibling.get('name'):
+                    prev_conditions.append(f"@name={self._escape_xpath_text(prev_sibling['name'])}")
+                if prev_conditions:
+                    candidates.append(
+                        f"{ancestor_xpath}//{prev_sibling.get('tag') or '*'}[" + " and ".join(prev_conditions[:2]) +
+                        f"]/following-sibling::{tag}[1]"
+                    )
+                    if target_conditions:
+                        candidates.append(
+                            f"{ancestor_xpath}//{prev_sibling.get('tag') or '*'}[" + " and ".join(prev_conditions[:2]) +
+                            f"]/following-sibling::{tag}[" + " and ".join(target_conditions[:2]) + "][1]"
+                        )
+
+            if next_sibling:
+                next_conditions = []
+                if next_sibling.get('text'):
+                    next_conditions.append(
+                        f"contains(normalize-space(.),{self._escape_xpath_text(next_sibling['text'][:30])})"
+                    )
+                for class_token in next_sibling.get('classes', []):
+                    next_conditions.append(f"contains(@class,{self._escape_xpath_text(class_token)})")
+                if next_sibling.get('name'):
+                    next_conditions.append(f"@name={self._escape_xpath_text(next_sibling['name'])}")
+                if next_conditions:
+                    candidates.append(
+                        f"{ancestor_xpath}//{next_sibling.get('tag') or '*'}[" + " and ".join(next_conditions[:2]) +
+                        f"]/preceding-sibling::{tag}[1]"
+                    )
+                    if target_conditions:
+                        candidates.append(
+                            f"{ancestor_xpath}//{next_sibling.get('tag') or '*'}[" + " and ".join(next_conditions[:2]) +
+                            f"]/preceding-sibling::{tag}[" + " and ".join(target_conditions[:2]) + "][1]"
+                        )
+
+        deduped = []
+        seen = set()
+        for candidate in candidates:
+            if candidate not in seen:
+                deduped.append(candidate)
+                seen.add(candidate)
+        return deduped
+
+    def _build_element_anchor_conditions(self, context, limit=3):
+        """Build stable element conditions for locator suggestions."""
+        conditions = []
+        elem_id = (context.get('id') or '').strip()
+        elem_name = (context.get('name') or '').strip()
+        elem_text = (context.get('text') or '').strip()
+
+        if elem_id and not self._is_dynamic_token(elem_id):
+            conditions.append(f"@id={self._escape_xpath_text(elem_id)}")
+        if elem_name:
+            conditions.append(f"@name={self._escape_xpath_text(elem_name)}")
+        for class_token in context.get('classes', []) or []:
+            conditions.append(f"contains(@class,{self._escape_xpath_text(class_token)})")
+        if elem_text:
+            conditions.append(f"contains(normalize-space(.),{self._escape_xpath_text(elem_text[:40])})")
+        return conditions[:limit]
+
+    def _build_parent_anchor_xpath(self, ancestor):
+        """Build a parent XPath anchor from stable classes, id, or name."""
+        if not ancestor:
+            return None
+
+        conditions = []
+        ancestor_id = (ancestor.get('id') or '').strip()
+        ancestor_name = (ancestor.get('name') or '').strip()
+        for class_token in ancestor.get('classes', []) or []:
+            conditions.append(f"contains(@class,{self._escape_xpath_text(class_token)})")
+        if ancestor_id and not self._is_dynamic_token(ancestor_id):
+            conditions.append(f"@id={self._escape_xpath_text(ancestor_id)}")
+        if ancestor_name:
+            conditions.append(f"@name={self._escape_xpath_text(ancestor_name)}")
+
+        if not conditions:
+            return None
+        return f"//{ancestor.get('tag') or '*'}[" + " and ".join(conditions[:3]) + "]"
+
+    def _build_locator_result_options(self, context):
+        """Build locator result options around siblings and the first two parent levels."""
+        if not context:
+            return []
+
+        tag = context.get('tag') or '*'
+        ancestors = context.get('ancestors') or []
+        target_conditions = self._build_element_anchor_conditions(context)
+        target_xpath = f"//{tag}"
+        if target_conditions:
+            target_xpath += "[" + " and ".join(target_conditions) + "]"
+
+        options = [f"Locator XPath: {target_xpath}"]
+        seen = {options[0]}
+
+        parent_one = ancestors[0] if len(ancestors) > 0 else None
+        parent_two = ancestors[1] if len(ancestors) > 1 else None
+        parent_one_anchor = self._build_parent_anchor_xpath(parent_one)
+        parent_two_anchor = self._build_parent_anchor_xpath(parent_two)
+
+        def add_option(label, xpath_value):
+            if not xpath_value or xpath_value in seen:
+                return
+            options.append(f"{label}: {xpath_value}")
+            seen.add(xpath_value)
+
+        if parent_one_anchor:
+            add_option("Upper Class Level 1", parent_one_anchor)
+            if target_conditions:
+                add_option(
+                    "Locator Under Upper Class Level 1",
+                    f"{parent_one_anchor}//{tag}[" + " and ".join(target_conditions) + "]"
+                )
+                add_option(
+                    "Next Sibling Using Upper Class Level 1",
+                    f"{parent_one_anchor}//{tag}[" + " and ".join(target_conditions) + "]/following-sibling::*[1]"
+                )
+                add_option(
+                    "Previous Sibling Using Upper Class Level 1",
+                    f"{parent_one_anchor}//{tag}[" + " and ".join(target_conditions) + "]/preceding-sibling::*[1]"
+                )
+        else:
+            options.append("Upper Class Level 1: not found")
+
+        if parent_two_anchor:
+            add_option("Upper Class Level 2", parent_two_anchor)
+            if target_conditions and not parent_one_anchor:
+                add_option(
+                    "Locator Under Upper Class Level 2",
+                    f"{parent_two_anchor}//{tag}[" + " and ".join(target_conditions) + "]"
+                )
+                add_option(
+                    "Next Sibling Using Upper Class Level 2",
+                    f"{parent_two_anchor}//{tag}[" + " and ".join(target_conditions) + "]/following-sibling::*[1]"
+                )
+                add_option(
+                    "Previous Sibling Using Upper Class Level 2",
+                    f"{parent_two_anchor}//{tag}[" + " and ".join(target_conditions) + "]/preceding-sibling::*[1]"
+                )
+        elif len(ancestors) > 1:
+            options.append("Upper Class Level 2: not found")
+
+        if target_conditions:
+            add_option("Next Sibling", f"{target_xpath}/following-sibling::*[1]")
+            add_option("Previous Sibling", f"{target_xpath}/preceding-sibling::*[1]")
+
+        return options
+
+    def _render_attempt_results(self, heading, attempt_logs, extra_lines=None):
+        """Render attempt logs and any follow-up information into the tester panel."""
+        lines = [heading, ""]
+        lines.extend(attempt_logs or ["No attempts were recorded."])
+        if extra_lines:
+            lines.append("")
+            lines.extend(extra_lines)
+        self.test_result_display.setText("\n".join(lines))
+
+    def get_locator_strategy(self, locator_type, locator_value):
+        """Return the appropriate By strategy based on locator type."""
+        strategies = {
+            "XPath": (By.XPATH, locator_value),
+            "ID": (By.ID, locator_value),
+            "CSS Selector": (By.CSS_SELECTOR, locator_value),
+            "Class Name": (By.CLASS_NAME, locator_value),
+            "Tag Name": (By.TAG_NAME, locator_value),
+            "Link Text": (By.LINK_TEXT, locator_value),
+            "Partial Link Text": (By.PARTIAL_LINK_TEXT, locator_value),
+            "Name": (By.NAME, locator_value),
+            "Text (Contains)": (By.XPATH, f"//*[contains(normalize-space(.),{self._escape_xpath_text(locator_value)})]"),
+        }
+        return strategies.get(locator_type)
+
+    def test_locator(self):
+        """Test a locator and display results."""
+        if not self.ensure_driver():
+            return
+
+        locator_value = self.test_locator_input.text().strip()
+        if not locator_value:
+            self.test_result_display.setText("Please enter a locator to test")
+            return
+
+        locator_type = self.locator_type_combo.currentText()
+        attempt_logs = []
+
+        self._set_processing_status(True, "Testing locator ...")
+        try:
+            self.test_result_display.clear()
+            self.test_result_display.setText(
+                f"Testing {locator_type}: {locator_value[:50]}...\n"
+            )
+
+            element, strategy_used, strategy_value_used, frame_path = self.try_locator_with_strategy(
+                locator_value,
+                locator_type,
+                attempt_logs=attempt_logs
+            )
+
+            if element:
+                by_strategy = self.get_locator_strategy(strategy_used, strategy_value_used)
+                if by_strategy:
+                    by_type, by_value = by_strategy
+                    snapshot, table_context, context = self._with_element_in_frame(
+                        by_type,
+                        by_value,
+                        frame_path,
+                        lambda current_element: (
+                            self._get_element_snapshot(current_element),
+                            self._extract_table_context(current_element),
+                            self._get_element_dom_context(current_element)
+                        ),
+                        timeout=4
+                    )
+                else:
+                    snapshot = self._get_element_snapshot(element)
+                    table_context = None
+                    context = self._get_element_dom_context(element)
+
+                extra_lines = [
+                    "SUCCESS - Element Found!",
+                    "",
+                    f"Strategy Used: {strategy_used}",
+                    f"Tag: <{snapshot.get('tag', '')}>",
+                    f"Frame: {self._format_frame_path(frame_path or [])}",
+                ]
+
+            elem_id = snapshot.get('id')
+            if elem_id:
+                extra_lines.append(f"ID: {elem_id}")
+
+            elem_class = snapshot.get('class')
+            if elem_class:
+                extra_lines.append(f"Class: {elem_class}")
+
+            elem_text = (snapshot.get('text') or '')[:50]
+            if elem_text:
+                extra_lines.append(f"Text: {elem_text}")
+
+            elem_value = snapshot.get('value')
+            if elem_value:
+                extra_lines.append(f"Value: {elem_value}")
+
+            dataframe = self._maybe_extract_table_for_locator(locator_value, frame_path, snapshot, table_context, attempt_logs)
+            if dataframe is not None:
+                extra_lines.append(f"Table DataFrame: {dataframe.shape[0]} row(s) x {dataframe.shape[1]} column(s)")
+                extra_lines.append(f"Table XPath: {(table_context or {}).get('xpath') or '-'}")
+
+            locator_result_options = self._build_locator_result_options(context or {})
+            if locator_result_options:
+                extra_lines.append("")
+                extra_lines.append("Locator Results:")
+                extra_lines.extend(locator_result_options)
+
+                self._refresh_frame_downloads_for_match(frame_path, attempt_logs)
+                self._render_attempt_results("Locator test log", attempt_logs, extra_lines)
+            else:
+                extra_lines = [f"FAILED - Element Not Found with {locator_type}", "", "Searching for similar elements..."]
+
+                html, _ = self.download_html()
+                if html:
+                    similar_elements = self.find_similar_locators(locator_value, html)
+
+                    if similar_elements:
+                        extra_lines.append("")
+                        extra_lines.append(f"Found {len(similar_elements)} similar option(s):")
+                        extra_lines.append("-" * 60)
+
+                        for i, (locator_type_alt, locator_value_alt, element_info) in enumerate(similar_elements[:5], 1):
+                            extra_lines.append("")
+                            extra_lines.append(f"{i}. Try: [{locator_type_alt}]")
+                            extra_lines.append(f"   Value: {locator_value_alt}")
+                            extra_lines.append(f"   Tag: <{element_info['tag']}>")
+                            if element_info['text']:
+                                extra_lines.append(f"   Text: {element_info['text'][:40]}")
+                    else:
+                        extra_lines.append("")
+                        extra_lines.append("No similar elements found in HTML.")
+
+                self._render_attempt_results("Locator test log", attempt_logs, extra_lines)
+        finally:
+            self._set_processing_status(False, "Locator test finished")
+
+    def get_test_locator_value(self):
+        """Read and display the current value or text for the test locator."""
+        if not self.ensure_driver():
+            return
+
+        locator_value = self.test_locator_input.text().strip()
+        if not locator_value:
+            self.test_result_display.setText("Please enter a locator to get its value")
+            return
+
+        locator_type = self.locator_type_combo.currentText()
+        attempt_logs = []
+        self._set_processing_status(True, "Reading locator value ...")
+        try:
+            self.test_result_display.clear()
+            self.test_result_display.setText(f"Reading value for {locator_type}: {locator_value[:50]}...\n")
+
+            element, strategy_used, strategy_value_used, frame_path = self.try_locator_with_strategy(
+                locator_value,
+                locator_type,
+                attempt_logs=attempt_logs
+            )
+            if not element:
+                self._render_attempt_results(
+                    "Get value log",
+                    attempt_logs,
+                    [f"FAILED - Element Not Found with {locator_type}", "", "No value could be read."]
+                )
+                return
+
+            by_strategy = self.get_locator_strategy(strategy_used, strategy_value_used)
+            if not by_strategy:
+                self._render_attempt_results(
+                    "Get value log",
+                    attempt_logs,
+                    ["FAILED - The matched locator strategy could not be rebuilt for value extraction."]
+                )
+                return
+
+            by_type, by_value = by_strategy
+            value, snapshot, table_context = self._with_element_in_frame(
+                by_type,
+                by_value,
+                frame_path,
+                lambda current_element: (
+                    lambda value_result: (value_result[0], value_result[1], self._extract_table_context(current_element))
+                )(self._extract_value_from_element(current_element, attempt_logs=attempt_logs)),
+                timeout=4
+            )
+            extra_lines = [
+                "SUCCESS - Element value read.",
+                "",
+                f"Strategy Used: {strategy_used}",
+                f"Tag: <{snapshot.get('tag', '')}>",
+                f"Frame: {self._format_frame_path(frame_path or [])}",
+                f"Value/Text: {value or '(empty)'}",
+            ]
+            if snapshot.get('selected_texts'):
+                extra_lines.append(f"Selected Options: {', '.join(snapshot['selected_texts'])}")
+            dataframe = self._maybe_extract_table_for_locator(locator_value, frame_path, snapshot, table_context, attempt_logs)
+            if dataframe is not None:
+                extra_lines.append(f"Table DataFrame: {dataframe.shape[0]} row(s) x {dataframe.shape[1]} column(s)")
+                extra_lines.append(f"Table XPath: {(table_context or {}).get('xpath') or '-'}")
+            self._refresh_frame_downloads_for_match(frame_path, attempt_logs)
+            self._render_attempt_results("Get value log", attempt_logs, extra_lines)
+        finally:
+            self._set_processing_status(False, "Value read finished")
+
+
+    def click_test_locator(self):
+        """Find the test locator and click the matching element."""
+        if not self.ensure_driver():
+            return
+
+        locator_value = self.test_locator_input.text().strip()
+        if not locator_value:
+            self.test_result_display.setText("Please enter a locator to click")
+            return
+
+        locator_type = self.locator_type_combo.currentText()
+        attempt_logs = []
+        self._set_processing_status(True, "Clicking locator ...")
+        try:
+            self.test_result_display.clear()
+            self.test_result_display.setText(
+                f"Clicking {locator_type}: {locator_value[:50]}...\n"
+            )
+
+            element, strategy_used, strategy_value_used, frame_path = self.try_locator_with_strategy(
+                locator_value,
+                locator_type,
+                attempt_logs=attempt_logs
+            )
+
+            if not element:
+                self._render_attempt_results(
+                    "Click locator log",
+                    attempt_logs,
+                    [f"FAILED - Element Not Found with {locator_type}", "", "Nothing was clicked."]
+                )
+                return
+
+            by_strategy = self.get_locator_strategy(strategy_used, strategy_value_used)
+            if not by_strategy:
+                self._render_attempt_results(
+                    "Click locator log",
+                    attempt_logs,
+                    ["FAILED - The matched locator strategy could not be rebuilt for click."]
+                )
+                return
+
+            by_type, by_value = by_strategy
+            success, mode, snapshot = self._with_element_in_frame(
+                by_type,
+                by_value,
+                frame_path,
+                lambda current_element: (
+                    lambda result: (result[0], result[1], self._get_element_snapshot(current_element))
+                )(self._click_element_with_fallback(
+                    current_element,
+                    attempt_logs=attempt_logs,
+                    force_dropdown=self.dropdown_toggle.isChecked()
+                )),
+                timeout=4
+            )
+            if success:
+                extra_lines = [
+                    "SUCCESS - Element Clicked!",
+                    "",
+                    f"Strategy Used: {strategy_used}",
+                    f"Click Mode: {mode}",
+                    f"Tag: <{snapshot.get('tag', '')}>",
+                    f"Frame: {self._format_frame_path(frame_path or [])}",
+                ]
+
+            elem_id = snapshot.get('id')
+            if elem_id:
+                extra_lines.append(f"ID: {elem_id}")
+
+            elem_text = (snapshot.get('text') or '')[:50]
+            if elem_text:
+                extra_lines.append(f"Text: {elem_text}")
+
+            elem_value = snapshot.get('value')
+            if elem_value:
+                extra_lines.append(f"Value: {elem_value}")
+
+                self._refresh_frame_downloads_for_match(frame_path, attempt_logs)
+                self._render_attempt_results("Click locator log", attempt_logs, extra_lines)
+            else:
+                self._render_attempt_results(
+                    "Click locator log",
+                    attempt_logs,
+                    ["FAILED - Click action failed after all available options were tried."]
+                )
+        finally:
+            self._set_processing_status(False, "Click action finished")
+
+    def generate_dynamic_xpath(self):
+        """Create and validate several stable XPath options for the current element."""
+        if not self.ensure_driver():
+            return
+
+        locator_value = self.test_locator_input.text().strip()
+        if not locator_value:
+            self.test_result_display.setText("Please enter a locator before generating a stable XPath")
+            return
+
+        locator_type = self.locator_type_combo.currentText()
+        attempt_logs = []
+        self._set_processing_status(True, "Generating stable XPath options ...")
+        try:
+            self._append_attempt_log(attempt_logs, f"Starting stable XPath generation from [{locator_type}] {locator_value}")
+
+            element, strategy_used, strategy_value_used, frame_path = self.try_locator_with_strategy(
+                locator_value,
+                locator_type,
+                attempt_logs=attempt_logs
+            )
+            if not element:
+                self._render_attempt_results(
+                    "Stable XPath process log",
+                    attempt_logs,
+                    ["FAILED - Could not locate the starting element, so no stable XPath could be generated."]
+                )
+                return
+
+            try:
+                by_strategy = self.get_locator_strategy(strategy_used, strategy_value_used)
+                if not by_strategy:
+                    self._render_attempt_results(
+                        "Stable XPath process log",
+                        attempt_logs,
+                        ["FAILED - The matched locator strategy could not be rebuilt for stable XPath generation."]
+                    )
+                    return
+                by_type, by_value = by_strategy
+                context = self._with_element_in_frame(
+                    by_type,
+                    by_value,
+                    frame_path,
+                    lambda current_element: self._get_element_dom_context(current_element),
+                    timeout=4
+                )
+            except Exception as e:
+                self._render_attempt_results(
+                    "Stable XPath process log",
+                    attempt_logs,
+                    [f"FAILED - Could not inspect the located element: {str(e)}"]
+                )
+                return
+
+            candidates = self._build_dynamic_xpath_candidates(context)
+            if not candidates:
+                self._render_attempt_results(
+                    "Stable XPath process log",
+                    attempt_logs,
+                    ["FAILED - No stable XPath candidates could be built from the element context."]
+                )
+                return
+
+            verified_options = []
+            for index, candidate in enumerate(candidates, 1):
+                self._append_attempt_log(attempt_logs, f"Trying stable XPath option {index}: {candidate}")
+                candidate_element, candidate_xpath, candidate_frame = self.try_xpath_variants(candidate)
+                if candidate_element:
+                    verified_options.append((candidate_xpath, candidate_frame))
+                    self._append_attempt_log(
+                        attempt_logs,
+                        f"SUCCESS with stable XPath option {index} in {self._format_frame_path(candidate_frame or [])}"
+                    )
+                else:
+                    self._append_attempt_log(attempt_logs, f"Stable XPath option {index} did not match.")
+
+            if not verified_options:
+                self._render_attempt_results(
+                    "Stable XPath process log",
+                    attempt_logs,
+                    ["FAILED - Generated stable XPath options were tried, but none could be validated."]
+                )
+                return
+
+            primary_xpath, primary_frame_path = verified_options[0]
+            self.test_locator_input.setText(primary_xpath)
+            self.locator_type_combo.setCurrentText("XPath")
+            self._refresh_frame_downloads_for_match(primary_frame_path, attempt_logs)
+
+            extra_lines = [
+                "SUCCESS - Stable XPath options generated and validated.",
+                "",
+                f"Original Strategy Used: {strategy_used}",
+                f"Primary XPath: {primary_xpath}",
+                f"Frame: {self._format_frame_path(primary_frame_path or [])}",
+                "",
+                "Validated Stable XPath Options:",
+            ]
+            for index, (xpath_value, xpath_frame) in enumerate(verified_options[:6], 1):
+                extra_lines.append(f"{index}. {xpath_value}")
+                extra_lines.append(f"   Frame: {self._format_frame_path(xpath_frame or [])}")
+
+            self._render_attempt_results("Stable XPath process log", attempt_logs, extra_lines)
+        finally:
+            self._set_processing_status(False, "Stable XPath generation finished")
+
+    def show_locator_result_details(self):
+        """Show detailed sibling and parent-based locator options for the current test locator."""
+        if not self.ensure_driver():
+            return
+
+        locator_value = self.test_locator_input.text().strip()
+        if not locator_value:
+            self.test_result_display.setText("Please enter a locator before requesting locator results")
+            return
+
+        locator_type = self.locator_type_combo.currentText()
+        attempt_logs = []
+        self._set_processing_status(True, "Building locator results ...")
+        try:
+            self._append_attempt_log(attempt_logs, f"Building locator results from [{locator_type}] {locator_value}")
+
+            element, strategy_used, strategy_value_used, frame_path = self.try_locator_with_strategy(
+                locator_value,
+                locator_type,
+                attempt_logs=attempt_logs
+            )
+            if not element:
+                self._render_attempt_results(
+                    "Locator result log",
+                    attempt_logs,
+                    ["FAILED - Could not locate the element, so no locator result options were built."]
+                )
+                return
+
+            by_strategy = self.get_locator_strategy(strategy_used, strategy_value_used)
+            if not by_strategy:
+                self._render_attempt_results(
+                    "Locator result log",
+                    attempt_logs,
+                    ["FAILED - The matched locator strategy could not be rebuilt for locator results."]
+                )
+                return
+
+            by_type, by_value = by_strategy
+            context = self._with_element_in_frame(
+                by_type,
+                by_value,
+                frame_path,
+                lambda current_element: self._get_element_dom_context(current_element),
+                timeout=4
+            )
+
+            extra_lines = [
+                "SUCCESS - Locator results generated.",
+                "",
+                f"Strategy Used: {strategy_used}",
+                f"Frame: {self._format_frame_path(frame_path or [])}",
+                "",
+            ]
+            extra_lines.extend(self._build_locator_result_options(context or {}))
+            self._refresh_frame_downloads_for_match(frame_path, attempt_logs)
+            self._render_attempt_results("Locator result log", attempt_logs, extra_lines)
+        finally:
+            self._set_processing_status(False, "Locator results finished")
+
+
+    def try_locator_with_strategy(self, locator_value, locator_type, attempt_logs=None):
+        """Try to find element with specific strategy across frames."""
+        strategies_to_try = self._build_strategy_list(locator_value, locator_type)
+        element, strategy_used, strategy_value_used, frame_path = self._locate_with_strategies(
+            strategies_to_try,
+            attempt_logs=attempt_logs,
+            timeout=4
+        )
+        if element:
+            return element, strategy_used, strategy_value_used, frame_path
+
+        return None, locator_type, locator_value, None
+
+
+    def find_similar_locators(self, search_term, html):
+        """Find similar locators in HTML based on search term."""
+        try:
+            soup = BeautifulSoup(html, 'lxml')
+            similar_locators = []
+            search_term_lower = search_term.lower()
+
+            # Search for elements containing similar text or attributes
+            for element in soup.find_all(True):  # True = find all tags
+                # Extract text content
+                elem_text = element.get_text(strip=True)[:50]
+
+                # Check if text matches
+                if search_term_lower in elem_text.lower():
+                    elem_id = element.get('id')
+                    elem_class = element.get('class')
+                    elem_name = element.get('name')
+
+                    # Create alternative locators
+                    if elem_id:
+                        similar_locators.append((
+                            "ID",
+                            elem_id,
+                            {
+                                'tag': element.name,
+                                'text': elem_text,
+                                'class': elem_class,
+                                'id': elem_id
+                            }
+                        ))
+
+                    if elem_class:
+                        class_name = elem_class[0] if isinstance(elem_class, list) else elem_class.split()[0]
+                        similar_locators.append((
+                            "CSS Selector",
+                            f"{element.name}.{class_name}",
+                            {
+                                'tag': element.name,
+                                'text': elem_text,
+                                'class': elem_class,
+                                'id': elem_id
+                            }
+                        ))
+
+                    xpath = self.build_xpath_from_element(element)
+                    if xpath:
+                        similar_locators.append((
+                            "XPath",
+                            xpath,
+                            {
+                                'tag': element.name,
+                                'text': elem_text,
+                                'class': elem_class,
+                                'id': elem_id
+                            }
+                        ))
+
+                    if elem_name:
+                        similar_locators.append((
+                            "Name",
+                            elem_name,
+                            {
+                                'tag': element.name,
+                                'text': elem_text,
+                                'class': elem_class,
+                                'id': elem_id
+                            }
+                        ))
+
+                # Also check attributes
+                if elem_id and search_term_lower in elem_id.lower():
+                    similar_locators.append((
+                        "ID",
+                        elem_id,
+                        {
+                            'tag': element.name,
+                            'text': elem_text,
+                            'class': element.get('class'),
+                            'id': elem_id
+                        }
+                    ))
+
+                if elem_class:
+                    classes = elem_class if isinstance(elem_class, list) else elem_class.split()
+                    for cls in classes:
+                        if search_term_lower in cls.lower():
+                            similar_locators.append((
+                                "CSS Selector",
+                                f".{cls}",
+                                {
+                                    'tag': element.name,
+                                    'text': elem_text,
+                                    'class': elem_class,
+                                    'id': elem_id
+                                }
+                            ))
+
+            # Remove duplicates and limit results
+            seen = set()
+            unique_locators = []
+            for loc_type, loc_value, elem_info in similar_locators:
+                key = (loc_type, loc_value)
+                if key not in seen:
+                    seen.add(key)
+                    unique_locators.append((loc_type, loc_value, elem_info))
+
+            return unique_locators[:5]  # Return top 5
+
+        except Exception as e:
+            print(f"Error finding similar locators: {str(e)}")
+            return []
+
+    def build_xpath_from_element(self, element):
+        """Build a simple XPath from a BeautifulSoup element."""
+        try:
+            path = []
+            current = element
+
+            while current and current.name:
+                tag = current.name
+                # Get position among siblings
+                siblings = [s for s in current.parent.children if s.name == tag]
+                position = siblings.index(current) + 1
+
+                if current.get('id'):
+                    return f"//{tag}[@id='{current.get('id')}']"
+
+                path.append(f"{tag}[{position}]")
+                current = current.parent
+
+            path.reverse()
+            return "/" + "/".join(path) if path else None
+        except:
+            return None
+
+    def _format_match_value(self, value):
+        """Normalize values for display in the results table."""
+        return self._normalize_display_text(value)
+
+    def _build_locator_options(self, match):
+        """Build a de-duplicated list of locator options for a match."""
+        locators = []
+        text = (match.get('text') or '').strip()
+        tag = self._format_match_value(match.get('tag'))
+        match_id = match.get('id')
+        match_name = match.get('name')
+        classes = self._format_match_value(match.get('class'))
+
+        if text:
+            locators.append(f"XPath Text: //*[contains(text(),'{text[:30]}')]")
+            locators.append(f"XPath Tag: //{tag}[contains(text(),'{text[:20]}')]")
+
+        if match_id:
+            locators.append(f"ID: {match_id}")
+            locators.append(f"CSS: #{match_id}")
+
+        first_class = classes.split()[0] if classes and classes != '-' else None
+        if first_class:
+            locators.append(f"CSS Class: .{first_class}")
+
+        if match_name:
+            locators.append(f"Name: {match_name}")
+
+        deduped = []
+        seen = set()
+        for locator in locators:
+            if locator not in seen:
+                deduped.append(locator)
+                seen.add(locator)
+        return deduped
+
+    def _sanitize_filename_part(self, value, fallback='report'):
+        """Create a filesystem-safe filename fragment."""
+        cleaned = re.sub(r'[^A-Za-z0-9._-]+', '_', (value or '').strip())
+        cleaned = cleaned.strip('._')
+        return cleaned[:50] or fallback
+
+    def _get_export_directory(self):
+        """Return the directory used for saved capture reports."""
+        export_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'captures')
+        os.makedirs(export_dir, exist_ok=True)
+        return export_dir
+
+    def _render_versions_cards(self, all_matches):
+        """Render record-by-record cards so each match boundary is obvious."""
+        cards = []
+        for index, match in enumerate(all_matches, 1):
+            locator_items = ''.join(
+                f"<li style=\"margin-bottom: 4px;\">{html.escape(locator)}</li>"
+                for locator in self._build_locator_options(match)
+            ) or '<li>-</li>'
+
+            cards.append(
+                f"""
+                <div style="margin: 0 0 16px 0; padding: 14px; border: 2px solid #1d4ed8; border-radius: 8px; background-color: #f8fafc; color: #111827;">
+                    <div style="font-size: 16px; font-weight: 700; margin-bottom: 10px; color: #1e3a8a;">
+                        Record {index} Start
+                    </div>
+                    <div style="margin-bottom: 6px;"><b>Tag:</b> {html.escape(self._format_match_value(match.get('tag')))}</div>
+                    <div style="margin-bottom: 6px;"><b>Text:</b> {self._format_expandable_html(match.get('text'))}</div>
+                    <div style="margin-bottom: 6px;"><b>ID:</b> {html.escape(self._format_match_value(match.get('id')))}</div>
+                    <div style="margin-bottom: 6px;"><b>Class:</b> {html.escape(self._format_match_value(match.get('class')))}</div>
+                    <div style="margin-bottom: 6px;"><b>Name:</b> {html.escape(self._format_match_value(match.get('name')))}</div>
+                    <div style="margin-bottom: 10px;"><b>Frame:</b> {html.escape(self._format_match_value(match.get('frame_path')))}</div>
+                    <div style="font-weight: 600; margin-bottom: 6px;">Locator Options</div>
+                    <ul style="margin: 0 0 12px 18px; padding: 0;">
+                        {locator_items}
+                    </ul>
+                    <div style="font-size: 13px; font-weight: 700; color: #1e3a8a;">
+                        Record {index} End
+                    </div>
+                </div>
+                """
+            )
+        return ''.join(cards)
+
+    def _render_versions_table(self, all_matches):
+        """Render find-all-versions results as an HTML table."""
+        rows = []
+        for index, match in enumerate(all_matches, 1):
+            locator_html = '<br>'.join(
+                html.escape(locator) for locator in self._build_locator_options(match)
+            ) or '-'
+            row_bg = "#eff6ff" if index % 2 else "#dbeafe"
+
+            rows.append(
+                f'<tr style="background-color: {row_bg}; color: #111827;">'
+                f'<td style="border: 1px solid #93c5fd; padding: 8px; vertical-align: top; background-color: {row_bg}; color: #111827;">{index}</td>'
+                f"<td style=\"border: 1px solid #93c5fd; padding: 8px; vertical-align: top; background-color: {row_bg}; color: #111827;\">{html.escape(self._format_match_value(match.get('tag')))}</td>"
+                f"<td style=\"border: 1px solid #93c5fd; padding: 8px; vertical-align: top; background-color: {row_bg}; color: #111827;\">{self._format_expandable_html(match.get('text'))}</td>"
+                f"<td style=\"border: 1px solid #93c5fd; padding: 8px; vertical-align: top; background-color: {row_bg}; color: #111827;\">{html.escape(self._format_match_value(match.get('id')))}</td>"
+                f"<td style=\"border: 1px solid #93c5fd; padding: 8px; vertical-align: top; background-color: {row_bg}; color: #111827;\">{html.escape(self._format_match_value(match.get('class')))}</td>"
+                f"<td style=\"border: 1px solid #93c5fd; padding: 8px; vertical-align: top; background-color: {row_bg}; color: #111827;\">{html.escape(self._format_match_value(match.get('name')))}</td>"
+                f"<td style=\"border: 1px solid #93c5fd; padding: 8px; vertical-align: top; background-color: {row_bg}; color: #111827;\">{html.escape(self._format_match_value(match.get('frame_path')))}</td>"
+                f'<td style="border: 1px solid #93c5fd; padding: 8px; vertical-align: top; background-color: {row_bg}; color: #111827;">{locator_html}</td>'
+                '</tr>'
+            )
+
+        return f"""
+        <table style="width: 100%; border-collapse: collapse; font-size: 12px; background-color: #ffffff; color: #111827;">
+                <thead>
+                    <tr style="background-color: #1e3a8a; color: #ffffff;">
+                        <th style="border: 1px solid #60a5fa; padding: 8px; background-color: #1e3a8a; color: #ffffff;">#</th>
+                        <th style="border: 1px solid #60a5fa; padding: 8px; background-color: #1e3a8a; color: #ffffff;">Tag</th>
+                        <th style="border: 1px solid #60a5fa; padding: 8px; background-color: #1e3a8a; color: #ffffff;">Text</th>
+                        <th style="border: 1px solid #60a5fa; padding: 8px; background-color: #1e3a8a; color: #ffffff;">ID</th>
+                        <th style="border: 1px solid #60a5fa; padding: 8px; background-color: #1e3a8a; color: #ffffff;">Class</th>
+                        <th style="border: 1px solid #60a5fa; padding: 8px; background-color: #1e3a8a; color: #ffffff;">Name</th>
+                        <th style="border: 1px solid #60a5fa; padding: 8px; background-color: #1e3a8a; color: #ffffff;">Frame</th>
+                        <th style="border: 1px solid #60a5fa; padding: 8px; background-color: #1e3a8a; color: #ffffff;">Locator Options</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(rows)}
+                </tbody>
+            </table>
+        """
+
+    def _render_versions_report(self, search_term, html_filename, all_matches, report_filename=None):
+        """Render the on-screen and exportable HTML report."""
+        self.expanded_text_registry.clear()
+        source_note = (
+            f"<p style=\"margin: 0 0 8px 0;\"><b>HTML downloaded:</b> {html.escape(html_filename)}</p>"
+            if html_filename else
+            ""
+        )
+        report_note = (
+            f"<p style=\"margin: 0 0 8px 0;\"><b>Exported report:</b> {html.escape(report_filename)}</p>"
+            if report_filename else
+            ""
+        )
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Find All Versions Report</title>
+</head>
+<body style="margin: 0; font-family: 'Segoe UI', sans-serif; background-color: #e0f2fe; color: #111827;">
+    <div style="max-width: 1280px; margin: 0 auto; padding: 18px;">
+        <div style="margin-bottom: 18px; padding: 16px; border-radius: 10px; background-color: #ffffff; border: 2px solid #7dd3fc;">
+            <h2 style="margin: 0 0 10px 0; color: #0f172a;">Find All Versions</h2>
+            <p style="margin: 0 0 8px 0;"><b>Search term:</b> {html.escape(search_term)}</p>
+            {source_note}
+            {report_note}
+            <p style="margin: 0;"><b>Total matches:</b> {len(all_matches)}</p>
+        </div>
+
+        <div style="margin-bottom: 22px;">
+            <h3 style="margin: 0 0 12px 0; color: #0f172a;">Record View</h3>
+            {self._render_versions_cards(all_matches)}
+        </div>
+
+        <div style="padding: 16px; border-radius: 10px; background-color: #ffffff; border: 2px solid #7dd3fc;">
+            <h3 style="margin: 0 0 12px 0; color: #0f172a;">Table View</h3>
+            <p style="margin: 0 0 12px 0; color: #475569;">Long text is limited to the first {self.preview_text_limit} characters. Click Expand to inspect the full value.</p>
+            {self._render_versions_table(all_matches)}
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+    def _export_versions_report(self, search_term, html_filename, all_matches):
+        """Save the results as an HTML report file."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_search_term = self._sanitize_filename_part(search_term, 'matches')
+        report_filename = f"matches_{safe_search_term}_{timestamp}.html"
+        report_path = os.path.join(self._get_export_directory(), report_filename)
+        report_html = self._render_versions_report(search_term, html_filename, all_matches, report_filename)
+
+        with open(report_path, 'w', encoding='utf-8') as report_file:
+            report_file.write(report_html)
+
+        return report_path, report_html
+
+    def find_all_versions_comprehensive(self):
+        if not self.ensure_driver():
+            return
+
+        search_term = self.locator_input.text().strip()
+        if not search_term:
+            self.output.append('Enter a search term')
+            return
+
+        self._set_processing_status(True, "Finding all versions ...")
+        try:
+            self.bg_color_toggle = not self.bg_color_toggle
+            self.output.clear()
+
+            html_content, html_filename = self.download_html()
+            if not html_content:
+                self.output.append('Failed to download HTML.')
+                return
+
+            all_matches = []
+            try:
+                frame_paths = self._collect_frame_paths()
+            except Exception:
+                frame_paths = [[]]
+
+            for frame_path in frame_paths:
+                try:
+                    self._switch_to_frame_path(frame_path)
+                    frame_html = self.driver.page_source
+                    all_matches.extend(
+                        self.search_text_in_html(
+                            search_term,
+                            frame_html,
+                            self._format_frame_path(frame_path)
+                        )
+                    )
+                except Exception:
+                    continue
+                finally:
+                    self.driver.switch_to.default_content()
+
+            if not all_matches:
+                self.output.append('No matches found!')
+                return
+
+            try:
+                report_path, report_html = self._export_versions_report(search_term, html_filename, all_matches)
+            except Exception as e:
+                self.output.append(f'Failed to export report HTML: {str(e)}')
+                return
+
+            self.output.setHtml(report_html)
+            if hasattr(self, 'workspace_tabs') and hasattr(self, 'results_tab_index'):
+                self.workspace_tabs.setCurrentIndex(self.results_tab_index)
+            self.statusBar().showMessage(f"Report exported to {report_path}")
+        finally:
+            self._set_processing_status(False, "Find all versions finished")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = EnterpriseDashboard()
+    window.show()
+    sys.exit(app.exec())
 
