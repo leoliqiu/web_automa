@@ -1034,56 +1034,249 @@ class EnterpriseDashboard(QMainWindow):
 
     def _build_analyze_locator_options(self, snapshot, context):
         """Build locator suggestions for Analyze Locator."""
+        return [
+            f"{row['type']}: {row['value']}"
+            for row in self._build_analyze_locator_rows(snapshot, context)
+        ]
+
+    def _add_locator_row(self, rows, seen, locator_type, locator_value):
+        """Append a locator row once so outputs stay deduplicated."""
+        locator_type = (locator_type or '').strip()
+        locator_value = (locator_value or '').strip()
+        if not locator_type or not locator_value:
+            return
+        key = (locator_type, locator_value)
+        if key in seen:
+            return
+        rows.append({"type": locator_type, "value": locator_value})
+        seen.add(key)
+
+    def _build_analyze_locator_rows(self, snapshot, context):
+        """Build structured locator rows for Analyze Locator output."""
         tag = (snapshot.get('tag') or '*').lower()
         text = (snapshot.get('text') or '').strip()
+        elem_value = (snapshot.get('value') or '').strip()
         elem_id = (snapshot.get('id') or '').strip()
         elem_name = (snapshot.get('name') or '').strip()
         elem_class = (snapshot.get('class') or '').strip()
+        elem_href = (snapshot.get('href') or '').strip()
+        elem_title = (snapshot.get('title') or '').strip()
         stable_classes = self._stable_class_tokens(elem_class)
         prev_sibling = context.get('prevSibling') if context else None
         next_sibling = context.get('nextSibling') if context else None
 
-        options = []
+        rows = []
+        seen = set()
 
         if text:
-            options.append(f"XPath Text: //{tag}[contains(normalize-space(.),{self._escape_xpath_text(text[:30])})]")
+            self._add_locator_row(
+                rows,
+                seen,
+                "XPath Text",
+                f"//{tag}[contains(normalize-space(.),{self._escape_xpath_text(text[:30])})]"
+            )
+            self._add_locator_row(
+                rows,
+                seen,
+                "XPath Text Exact",
+                f"//{tag}[normalize-space(.)={self._escape_xpath_text(text[:60])}]"
+            )
+            if tag == 'a':
+                self._add_locator_row(rows, seen, "Link Text", text[:100])
+                self._add_locator_row(rows, seen, "Partial Link Text", text[:30])
+
+        if elem_value:
+            self._add_locator_row(rows, seen, "XPath Value", f"//{tag}[@value={self._escape_xpath_text(elem_value)}]")
 
         if elem_id:
-            options.append(f"ID: {elem_id}")
-            options.append(f"CSS ID: #{elem_id}")
-            options.append(f"XPath ID: //{tag}[@id={self._escape_xpath_text(elem_id)}]")
+            self._add_locator_row(rows, seen, "ID", elem_id)
+            self._add_locator_row(rows, seen, "CSS ID", f"#{elem_id}")
+            self._add_locator_row(
+                rows,
+                seen,
+                "XPath ID",
+                f"//{tag}[@id={self._escape_xpath_text(elem_id)}]"
+            )
 
         if elem_name:
-            options.append(f"Name: {elem_name}")
-            options.append(f"XPath Name: //{tag}[@name={self._escape_xpath_text(elem_name)}]")
+            self._add_locator_row(rows, seen, "Name", elem_name)
+            self._add_locator_row(
+                rows,
+                seen,
+                "XPath Name",
+                f"//{tag}[@name={self._escape_xpath_text(elem_name)}]"
+            )
+
+        if elem_href:
+            self._add_locator_row(rows, seen, "Href", elem_href)
+            self._add_locator_row(rows, seen, "CSS Href", f"{tag}[href='{elem_href}']")
+            self._add_locator_row(rows, seen, "XPath Href", f"//{tag}[@href={self._escape_xpath_text(elem_href)}]")
+
+        if elem_title:
+            self._add_locator_row(rows, seen, "Title", elem_title)
+            self._add_locator_row(rows, seen, "CSS Title", f"{tag}[title='{elem_title}']")
+            self._add_locator_row(rows, seen, "XPath Title", f"//{tag}[@title={self._escape_xpath_text(elem_title)}]")
 
         if stable_classes:
             class_conditions = " and ".join(
                 f"contains(@class,{self._escape_xpath_text(class_token)})" for class_token in stable_classes[:2]
             )
-            options.append(f"CSS Class: .{stable_classes[0]}")
-            options.append(f"CSS Tag.Class: {tag}.{stable_classes[0]}")
-            options.append(f"XPath Class: //{tag}[{class_conditions}]")
+            first_class = stable_classes[0]
+            self._add_locator_row(rows, seen, "Class Name", first_class)
+            self._add_locator_row(rows, seen, "CSS Class", f".{first_class}")
+            self._add_locator_row(rows, seen, "Class Auto", f"{tag}.{first_class}")
+            self._add_locator_row(rows, seen, "CSS Tag.Class", f"{tag}.{first_class}")
+            self._add_locator_row(rows, seen, "XPath Class", f"//{tag}[{class_conditions}]")
 
         dynamic_candidates = self._build_dynamic_xpath_candidates(context or {})
         for candidate in dynamic_candidates:
             if "following-sibling::" in candidate:
-                options.append(f"Stable XPath From Previous Sibling: {candidate}")
+                self._add_locator_row(rows, seen, "Stable XPath From Previous Sibling", candidate)
             elif "preceding-sibling::" in candidate:
-                options.append(f"Stable XPath From Next Sibling: {candidate}")
+                self._add_locator_row(rows, seen, "Stable XPath From Next Sibling", candidate)
             else:
-                options.append(f"Stable XPath: {candidate}")
+                self._add_locator_row(rows, seen, "Stable XPath", candidate)
 
         for option in self._build_locator_result_options(context or {}):
-            options.append(option)
+            locator_type, locator_value = option.split(": ", 1) if ": " in option else ("Locator", option)
+            self._add_locator_row(rows, seen, locator_type, locator_value)
+        return rows
 
-        deduped = []
+    def _build_selected_element_locator_rows(self, element_data):
+        """Build structured locator rows for selected element output."""
+        rows = []
         seen = set()
-        for option in options:
-            if option not in seen:
-                deduped.append(option)
-                seen.add(option)
-        return deduped
+        tag = (element_data.get('tag') or '*').lower()
+        text = (element_data.get('text') or '').strip()
+        elem_id = (element_data.get('id') or '').strip()
+        elem_name = (element_data.get('name') or '').strip()
+        elem_class = (element_data.get('class') or '').strip()
+        elem_type = (element_data.get('type') or '').strip()
+        elem_value = (element_data.get('value') or '').strip()
+        href = (element_data.get('href') or '').strip()
+        title = (element_data.get('title') or '').strip()
+        xpath = (element_data.get('xpath') or '').strip()
+
+        if xpath:
+            self._add_locator_row(rows, seen, "XPath", xpath)
+        if text:
+            self._add_locator_row(rows, seen, "XPath Text", f"//{tag}[contains(text(),'{text[:30]}')]")
+            self._add_locator_row(rows, seen, "XPath Text Exact", f"//{tag}[normalize-space(.)={self._escape_xpath_text(text[:60])}]")
+            if tag == 'a':
+                self._add_locator_row(rows, seen, "Link Text", text[:100])
+                self._add_locator_row(rows, seen, "Partial Link Text", text[:30])
+        if elem_id:
+            self._add_locator_row(rows, seen, "ID", elem_id)
+            self._add_locator_row(rows, seen, "CSS ID", f"#{elem_id}")
+        if elem_name:
+            self._add_locator_row(rows, seen, "Name", elem_name)
+        stable_classes = self._stable_class_tokens(elem_class)
+        if stable_classes:
+            first_class = stable_classes[0]
+            self._add_locator_row(rows, seen, "Class Name", first_class)
+            self._add_locator_row(rows, seen, "CSS Class", f".{first_class}")
+            self._add_locator_row(rows, seen, "Class Auto", f"{tag}.{first_class}")
+            self._add_locator_row(rows, seen, "CSS Tag.Class", f"{tag}.{first_class}")
+        if elem_value:
+            self._add_locator_row(rows, seen, "Value", elem_value)
+            self._add_locator_row(rows, seen, "XPath Value", f"//{tag}[@value={self._escape_xpath_text(elem_value)}]")
+        if elem_type:
+            self._add_locator_row(rows, seen, "Type", f"[{elem_type}]")
+        if href:
+            self._add_locator_row(rows, seen, "Href", href)
+            self._add_locator_row(rows, seen, "CSS Href", f"{tag}[href='{href}']")
+            self._add_locator_row(rows, seen, "XPath Href", f"//{tag}[@href={self._escape_xpath_text(href)}]")
+            self._add_locator_row(rows, seen, "Link", f"a[href='{href}']")
+        if title:
+            self._add_locator_row(rows, seen, "Title", title)
+            self._add_locator_row(rows, seen, "CSS Title", f"{tag}[title='{title}']")
+            self._add_locator_row(rows, seen, "XPath Title", f"//{tag}[@title={self._escape_xpath_text(title)}]")
+        return rows
+
+    def _append_locator_rows_table(self, locator_rows):
+        """Render locator rows into the output panel as a copy-friendly table."""
+        if not locator_rows:
+            self.output.append("<div style=\"margin-left: 12px;\">No locator options found.</div>")
+            return
+        row_html = []
+        for index, row in enumerate(locator_rows, 1):
+            row_bg = "#f8fafc" if index % 2 else "#eff6ff"
+            row_html.append(
+                f"<tr style=\"background-color: {row_bg};\">"
+                f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; vertical-align: top; color: #0f172a;\">{html.escape(row['type'])}</td>"
+                f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; vertical-align: top; color: #0f172a; font-family: Consolas, 'Courier New', monospace;\">{html.escape(row['value'])}</td>"
+                f"</tr>"
+            )
+        self.output.append(
+            """
+            <table style="width: 100%; border-collapse: collapse; margin-left: 12px; margin-top: 4px; font-size: 12px;">
+                <thead>
+                    <tr style="background-color: #1e3a8a; color: #ffffff;">
+                        <th style="border: 1px solid #93c5fd; padding: 7px 8px; text-align: left;">Type</th>
+                        <th style="border: 1px solid #93c5fd; padding: 7px 8px; text-align: left;">Locator Value Identified</th>
+                    </tr>
+                </thead>
+                <tbody>
+            """
+            + "".join(row_html) +
+            """
+                </tbody>
+            </table>
+            """
+        )
+
+    def _render_tester_locator_results_html(self, heading, attempt_logs, info_lines, locator_rows):
+        """Render tester locator results using an HTML table for easier copying."""
+        log_html = "<br>".join(html.escape(line) for line in ([heading, ""] + (attempt_logs or ["No attempts were recorded."])))
+
+        info_html = ""
+        if info_lines:
+            info_items = "".join(
+                f"<div style=\"margin-bottom: 4px;\">{html.escape(line)}</div>"
+                for line in info_lines if line
+            )
+            info_html = (
+                "<div style=\"margin: 14px 0 10px 0; padding: 10px 12px; "
+                "border: 1px solid #cbd5e1; border-radius: 6px; background-color: #f8fafc; color: #0f172a;\">"
+                f"{info_items}"
+                "</div>"
+            )
+
+        if locator_rows:
+            row_html = []
+            for index, row in enumerate(locator_rows, 1):
+                row_bg = "#f8fafc" if index % 2 else "#eff6ff"
+                row_html.append(
+                    f"<tr style=\"background-color: {row_bg};\">"
+                    f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; vertical-align: top; color: #0f172a;\">{html.escape(row['type'])}</td>"
+                    f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; vertical-align: top; color: #0f172a; font-family: Consolas, 'Courier New', monospace;\">{html.escape(row['value'])}</td>"
+                    f"</tr>"
+                )
+            locator_table_html = (
+                "<table style=\"width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px;\">"
+                "<thead>"
+                "<tr style=\"background-color: #1e3a8a; color: #ffffff;\">"
+                "<th style=\"border: 1px solid #93c5fd; padding: 7px 8px; text-align: left;\">Type</th>"
+                "<th style=\"border: 1px solid #93c5fd; padding: 7px 8px; text-align: left;\">Locator Value Identified</th>"
+                "</tr>"
+                "</thead>"
+                "<tbody>"
+                + "".join(row_html) +
+                "</tbody>"
+                "</table>"
+            )
+        else:
+            locator_table_html = "<div style=\"margin-top: 8px; color: #475569;\">No locator options found.</div>"
+
+        self.test_result_display.setHtml(
+            "<div style=\"font-family: Segoe UI, Arial, sans-serif; color: #0f172a;\">"
+            f"<div style=\"font-weight: 700; margin-bottom: 8px;\">{html.escape(heading)}</div>"
+            f"<div style=\"padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background-color: #ffffff;\">{log_html}</div>"
+            f"{info_html}"
+            "<div style=\"font-weight: 700; margin-top: 12px; margin-bottom: 6px;\">Locator Results</div>"
+            f"{locator_table_html}"
+            "</div>"
+        )
 
     def analyze_locator(self):
         if not self.ensure_driver():
@@ -1139,13 +1332,14 @@ class EnterpriseDashboard(QMainWindow):
                 self.output.append(f"  ID: {snapshot.get('id') or '(none)'}")
                 self.output.append(f"  Name: {snapshot.get('name') or '(none)'}")
                 self.output.append(f"  Class: {snapshot.get('class') or '(none)'}")
+                self.output.append(f"  Href: {snapshot.get('href') or '(none)'}")
+                self.output.append(f"  Title: {snapshot.get('title') or '(none)'}")
                 self.output.append(f"  Text: {(snapshot.get('text') or '(none)')[:60]}")
                 self.output.append(f"  Frame: {self._format_frame_path(frame_path or [])}")
 
                 self.output.append("\nLOCATOR OPTIONS:")
-                locator_options = self._build_analyze_locator_options(snapshot, context)
-                for index, option in enumerate(locator_options, 1):
-                    self.output.append(f"  {index}. {option}")
+                locator_rows = self._build_analyze_locator_rows(snapshot, context)
+                self._append_locator_rows_table(locator_rows)
 
                 self._refresh_frame_downloads_for_match(frame_path)
                 if hasattr(self, 'workspace_tabs') and hasattr(self, 'results_tab_index'):
@@ -1216,8 +1410,10 @@ class EnterpriseDashboard(QMainWindow):
                 const className = element.getAttribute('class') || null;
                 const name = element.getAttribute('name') || null;
                 const type = element.getAttribute('type') || null;
+                const value = element.getAttribute('value') || null;
                 const text = (element.textContent || '').substring(0, 100).trim();
                 const href = element.getAttribute('href') || null;
+                const title = element.getAttribute('title') || null;
 
                 window.selectedElementData = {
                     tag: tag,
@@ -1225,8 +1421,10 @@ class EnterpriseDashboard(QMainWindow):
                     class: className,
                     name: name,
                     type: type,
+                    value: value,
                     text: text,
                     href: href,
+                    title: title,
                     xpath: getXPath(element)
                 };
             }
@@ -1342,38 +1540,18 @@ class EnterpriseDashboard(QMainWindow):
             self.output.append(f"  Name: {element_data['name']}")
         if element_data['type']:
             self.output.append(f"  Type: {element_data['type']}")
+        if element_data.get('value'):
+            self.output.append(f"  Value: {element_data['value']}")
         if element_data['text']:
             self.output.append(f"  Text: {element_data['text'][:60]}")
         if element_data['href']:
             self.output.append(f"  Href: {element_data['href']}")
+        if element_data.get('title'):
+            self.output.append(f"  Title: {element_data['title']}")
         self.output.append(f"  Frame: {self._format_frame_path(selected_frame_path)}")
 
         self.output.append("\nLOCATOR OPTIONS:")
-        locators = []
-
-        if element_data['xpath']:
-            locators.append(f"  1. XPath: {element_data['xpath']}")
-        if element_data['text']:
-            locators.append(f"  2. XPath Text: //{element_data['tag']}[contains(text(),'{element_data['text'][:30]}')]")
-        if element_data['id']:
-            locators.append(f"  3. ID: {element_data['id']}")
-            locators.append(f"  4. CSS ID: #{element_data['id']}")
-        if element_data['name']:
-            locators.append(f"  5. Name: {element_data['name']}")
-        if element_data['class']:
-            first_class = element_data['class'].split()[0]
-            locators.append(f"  6. CSS Class: .{first_class}")
-            locators.append(f"  7. CSS Tag.Class: {element_data['tag']}.{first_class}")
-        if element_data['type']:
-            locators.append(f"  8. Type: [{element_data['type']}]")
-        if element_data['href']:
-            locators.append(f"  9. Link: a[href='{element_data['href']}']")
-
-        seen = set()
-        for locator in locators:
-            if locator not in seen:
-                self.output.append(locator)
-                seen.add(locator)
+        self._append_locator_rows_table(self._build_selected_element_locator_rows(element_data))
 
         if element_data.get('xpath'):
             self.test_locator_input.setText(element_data['xpath'])
@@ -1458,38 +1636,18 @@ class EnterpriseDashboard(QMainWindow):
                 self.output.append(f"  Name: {element_data['name']}")
             if element_data['type']:
                 self.output.append(f"  Type: {element_data['type']}")
+            if element_data.get('value'):
+                self.output.append(f"  Value: {element_data['value']}")
             if element_data['text']:
                 self.output.append(f"  Text: {element_data['text'][:60]}")
             if element_data['href']:
                 self.output.append(f"  Href: {element_data['href']}")
+            if element_data.get('title'):
+                self.output.append(f"  Title: {element_data['title']}")
             self.output.append(f"  Frame: {self._format_frame_path(selected_frame_path)}")
 
             self.output.append("\nLOCATOR OPTIONS:")
-            locators = []
-
-            if element_data['xpath']:
-                locators.append(f"  1. XPath: {element_data['xpath']}")
-            if element_data['text']:
-                locators.append(f"  2. XPath Text: //{element_data['tag']}[contains(text(),'{element_data['text'][:30]}')]")
-            if element_data['id']:
-                locators.append(f"  3. ID: {element_data['id']}")
-                locators.append(f"  4. CSS ID: #{element_data['id']}")
-            if element_data['name']:
-                locators.append(f"  5. Name: {element_data['name']}")
-            if element_data['class']:
-                first_class = element_data['class'].split()[0]
-                locators.append(f"  6. CSS Class: .{first_class}")
-                locators.append(f"  7. CSS Tag.Class: {element_data['tag']}.{first_class}")
-            if element_data['type']:
-                locators.append(f"  8. Type: [{element_data['type']}]")
-            if element_data['href']:
-                locators.append(f"  9. Link: a[href='{element_data['href']}']")
-
-            seen = set()
-            for locator in locators:
-                if locator not in seen:
-                    self.output.append(locator)
-                    seen.add(locator)
+            self._append_locator_rows_table(self._build_selected_element_locator_rows(element_data))
 
             self.output.append("=" * 100)
             self.output.append("You can now copy any locator above to use in your tests")
@@ -1614,13 +1772,15 @@ class EnterpriseDashboard(QMainWindow):
             'value': '',
             'name': '',
             'type': '',
+            'href': '',
+            'title': '',
             'selected_texts': [],
         }
         try:
             snapshot['tag'] = element.tag_name or ''
         except Exception:
             pass
-        for attr in ('id', 'class', 'value', 'name', 'type'):
+        for attr in ('id', 'class', 'value', 'name', 'type', 'href', 'title'):
             try:
                 snapshot[attr] = element.get_attribute(attr) or ''
             except Exception:
@@ -2436,6 +2596,10 @@ class EnterpriseDashboard(QMainWindow):
                 attempt_logs=attempt_logs
             )
 
+            requested_locator_rows = []
+            requested_seen = set()
+            self._add_locator_row(requested_locator_rows, requested_seen, locator_type, locator_value)
+
             if element:
                 by_strategy = self.get_locator_strategy(strategy_used, strategy_value_used)
                 if by_strategy:
@@ -2456,67 +2620,68 @@ class EnterpriseDashboard(QMainWindow):
                     table_context = None
                     context = self._get_element_dom_context(element)
 
-                extra_lines = [
+                info_lines = [
                     "SUCCESS - Element Found!",
-                    "",
                     f"Strategy Used: {strategy_used}",
                     f"Tag: <{snapshot.get('tag', '')}>",
                     f"Frame: {self._format_frame_path(frame_path or [])}",
                 ]
 
-            elem_id = snapshot.get('id')
-            if elem_id:
-                extra_lines.append(f"ID: {elem_id}")
+                elem_id = snapshot.get('id')
+                if elem_id:
+                    info_lines.append(f"ID: {elem_id}")
 
-            elem_class = snapshot.get('class')
-            if elem_class:
-                extra_lines.append(f"Class: {elem_class}")
+                elem_class = snapshot.get('class')
+                if elem_class:
+                    info_lines.append(f"Class: {elem_class}")
 
-            elem_text = (snapshot.get('text') or '')[:50]
-            if elem_text:
-                extra_lines.append(f"Text: {elem_text}")
+                elem_text = (snapshot.get('text') or '')[:50]
+                if elem_text:
+                    info_lines.append(f"Text: {elem_text}")
 
-            elem_value = snapshot.get('value')
-            if elem_value:
-                extra_lines.append(f"Value: {elem_value}")
+                elem_value = snapshot.get('value')
+                if elem_value:
+                    info_lines.append(f"Value: {elem_value}")
 
-            dataframe = self._maybe_extract_table_for_locator(locator_value, frame_path, snapshot, table_context, attempt_logs)
-            if dataframe is not None:
-                extra_lines.append(f"Table DataFrame: {dataframe.shape[0]} row(s) x {dataframe.shape[1]} column(s)")
-                extra_lines.append(f"Table XPath: {(table_context or {}).get('xpath') or '-'}")
+                dataframe = self._maybe_extract_table_for_locator(locator_value, frame_path, snapshot, table_context, attempt_logs)
+                if dataframe is not None:
+                    info_lines.append(f"Table DataFrame: {dataframe.shape[0]} row(s) x {dataframe.shape[1]} column(s)")
+                    info_lines.append(f"Table XPath: {(table_context or {}).get('xpath') or '-'}")
 
-            locator_result_options = self._build_locator_result_options(context or {})
-            if locator_result_options:
-                extra_lines.append("")
-                extra_lines.append("Locator Results:")
-                extra_lines.extend(locator_result_options)
+                locator_rows = []
+                seen = set()
+                for row in requested_locator_rows:
+                    self._add_locator_row(locator_rows, seen, row.get("type"), row.get("value"))
+                if strategy_used != locator_type or strategy_value_used != locator_value:
+                    self._add_locator_row(locator_rows, seen, strategy_used, strategy_value_used)
+                for row in self._build_selected_element_locator_rows(snapshot or {}):
+                    self._add_locator_row(locator_rows, seen, row.get("type"), row.get("value"))
+                for option in self._build_locator_result_options(context or {}):
+                    locator_type_option, locator_value_option = option.split(": ", 1) if ": " in option else ("Locator", option)
+                    self._add_locator_row(locator_rows, seen, locator_type_option, locator_value_option)
 
                 self._refresh_frame_downloads_for_match(frame_path, attempt_logs)
-                self._render_attempt_results("Locator test log", attempt_logs, extra_lines)
+                self._render_tester_locator_results_html("Locator test log", attempt_logs, info_lines, locator_rows)
             else:
-                extra_lines = [f"FAILED - Element Not Found with {locator_type}", "", "Searching for similar elements..."]
+                info_lines = [f"FAILED - Element Not Found with {locator_type}", "Searching for similar elements..."]
 
                 html, _ = self.download_html()
                 if html:
                     similar_elements = self.find_similar_locators(locator_value, html)
 
                     if similar_elements:
-                        extra_lines.append("")
-                        extra_lines.append(f"Found {len(similar_elements)} similar option(s):")
-                        extra_lines.append("-" * 60)
+                        info_lines.append(f"Found {len(similar_elements)} similar option(s):")
 
                         for i, (locator_type_alt, locator_value_alt, element_info) in enumerate(similar_elements[:5], 1):
-                            extra_lines.append("")
-                            extra_lines.append(f"{i}. Try: [{locator_type_alt}]")
-                            extra_lines.append(f"   Value: {locator_value_alt}")
-                            extra_lines.append(f"   Tag: <{element_info['tag']}>")
+                            info_lines.append(f"{i}. Try: [{locator_type_alt}]")
+                            info_lines.append(f"Value: {locator_value_alt}")
+                            info_lines.append(f"Tag: <{element_info['tag']}>")
                             if element_info['text']:
-                                extra_lines.append(f"   Text: {element_info['text'][:40]}")
+                                info_lines.append(f"Text: {element_info['text'][:40]}")
                     else:
-                        extra_lines.append("")
-                        extra_lines.append("No similar elements found in HTML.")
+                        info_lines.append("No similar elements found in HTML.")
 
-                self._render_attempt_results("Locator test log", attempt_logs, extra_lines)
+                self._render_tester_locator_results_html("Locator test log", attempt_logs, info_lines, requested_locator_rows)
         finally:
             self._set_processing_status(False, "Locator test finished")
 
@@ -2823,24 +2988,31 @@ class EnterpriseDashboard(QMainWindow):
                 return
 
             by_type, by_value = by_strategy
-            context = self._with_element_in_frame(
+            snapshot, context = self._with_element_in_frame(
                 by_type,
                 by_value,
                 frame_path,
-                lambda current_element: self._get_element_dom_context(current_element),
+                lambda current_element: (
+                    self._get_element_snapshot(current_element),
+                    self._get_element_dom_context(current_element)
+                ),
                 timeout=4
             )
 
-            extra_lines = [
+            info_lines = [
                 "SUCCESS - Locator results generated.",
-                "",
                 f"Strategy Used: {strategy_used}",
                 f"Frame: {self._format_frame_path(frame_path or [])}",
-                "",
             ]
-            extra_lines.extend(self._build_locator_result_options(context or {}))
+            locator_rows = []
+            seen = set()
+            for row in self._build_selected_element_locator_rows(snapshot or {}):
+                self._add_locator_row(locator_rows, seen, row.get("type"), row.get("value"))
+            for option in self._build_locator_result_options(context or {}):
+                locator_type_option, locator_value_option = option.split(": ", 1) if ": " in option else ("Locator", option)
+                self._add_locator_row(locator_rows, seen, locator_type_option, locator_value_option)
             self._refresh_frame_downloads_for_match(frame_path, attempt_logs)
-            self._render_attempt_results("Locator result log", attempt_logs, extra_lines)
+            self._render_tester_locator_results_html("Locator result log", attempt_logs, info_lines, locator_rows)
         finally:
             self._set_processing_status(False, "Locator results finished")
 
@@ -3239,4 +3411,3 @@ if __name__ == "__main__":
     window = EnterpriseDashboard()
     window.show()
     sys.exit(app.exec())
-
