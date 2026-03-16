@@ -58,6 +58,21 @@ Retry examples:
     if not match:
         raise TimeoutException("Element not found after fixed retries")
 
+Table extraction examples:
+    # Extract the nearest table around a matched element.
+    result = smart.extract_table("//span[text()='Order 1001']", locator_type="xpath")
+    print(result["table"]["headers"])
+    print(result["table"]["rows"])
+
+    # Extract when the locator already points to the table element.
+    table_result = smart.extract_table(
+        "//table[@id='orders']",
+        locator_type="xpath",
+        element_is_table=True,
+    )
+    print(table_result["table"]["row_count"])
+    print(table_result["table"]["column_count"])
+
 Locator options for `smart.find(...)` and `smart.click(...)`:
     - `locator_type=None` or `"auto"`:
       Auto-detects from the locator text.
