@@ -204,6 +204,7 @@ class SmartWebLocator:
         "partial_link_text": "partial link text",
         "text": "text",
         "text contains": "text",
+        "text (contains)": "text",
         "href": "href",
         "sibling": "sibling",
     }
@@ -866,6 +867,60 @@ class SmartWebLocator:
             return element.get_attribute(attribute)
 
         return self._run_with_match(match, _read_attribute)
+
+    def extract_table(
+        self,
+        locator: str,
+        locator_type: Optional[str] = None,
+        timeout: Optional[float] = None,
+        include_frames: bool = True,
+        include_popups: bool = True,
+        element_is_table: bool = False,
+    ) -> dict:
+        match = self.wait_for(
+            locator=locator,
+            locator_type=locator_type,
+            condition="present",
+            timeout=timeout,
+            include_frames=include_frames,
+            include_popups=include_popups,
+            activate_match=False,
+        )
+        if not match:
+            raise TimeoutException(self._build_not_found_message("element for table extraction", locator))
+        return self.extract_table_from_match(match, element_is_table=element_is_table)
+
+    def extract_table_from_match(
+        self,
+        match: LocatorMatch,
+        element_is_table: bool = False,
+    ) -> dict:
+        table = self._run_with_match(
+            match,
+            lambda element: self.extract_table_from_element(element, element_is_table=element_is_table),
+        )
+        if not table:
+            target_label = "table element" if element_is_table else "table near element"
+            raise TimeoutException(
+                f"Unable to extract {target_label} using [{match.strategy_name}] {match.value}"
+            )
+        return {
+            "strategy_name": match.strategy_name,
+            "by": match.by,
+            "value": match.value,
+            "window_handle": match.window_handle,
+            "frame_path": list(match.frame_path),
+            "location": match.location_label,
+            "found_in_popup": match.found_in_popup,
+            "table": table,
+        }
+
+    def extract_table_from_element(
+        self,
+        element: WebElement,
+        element_is_table: bool = False,
+    ) -> Optional[dict]:
+        return self._extract_table_context(element, element_is_table=element_is_table)
 
     def describe_match(
         self,
@@ -1848,6 +1903,210 @@ class SmartWebLocator:
             "return (arguments[0].innerText || arguments[0].textContent || '').trim();",
             element,
         )
+
+    def _extract_table_context(
+        self,
+        element: WebElement,
+        element_is_table: bool = False,
+    ) -> Optional[dict]:
+        script = """
+        const element = arguments[0];
+        const elementIsTable = !!arguments[1];
+
+        function stableClasses(node) {
+            if (!node) return [];
+            return (node.className || '')
+                .split(/\\s+/)
+                .map(token => token.trim())
+                .filter(token => token && !(/[0-9]{3,}/.test(token) || (token.length > 10 && /[A-Za-z]/.test(token) && /\\d/.test(token))))
+                .slice(0, 3);
+        }
+
+        function cleanText(value) {
+            return (value || '').replace(/\\s+/g, ' ').trim();
+        }
+
+        function getElementText(node) {
+            return cleanText(node ? (node.innerText || node.textContent || '') : '');
+        }
+
+        function buildXPath(node) {
+            if (!node) return '';
+            if (node.id) {
+                return `//${node.tagName.toLowerCase()}[@id="${node.id}"]`;
+            }
+
+            const path = [];
+            let current = node;
+            while (current && current.nodeType === 1) {
+                let index = 1;
+                let sibling = current.previousElementSibling;
+                while (sibling) {
+                    if (sibling.tagName === current.tagName) {
+                        index += 1;
+                    }
+                    sibling = sibling.previousElementSibling;
+                }
+                path.unshift(`${current.tagName.toLowerCase()}[${index}]`);
+                current = current.parentElement;
+                if (current && current.tagName && current.tagName.toLowerCase() === 'html') {
+                    path.unshift('html[1]');
+                    break;
+                }
+            }
+            return '/' + path.join('/');
+        }
+
+        function getCellText(cell) {
+            return getElementText(cell);
+        }
+
+        function reconstructRows(table) {
+            const sourceRows = Array.from(table.querySelectorAll('tr'));
+            const grid = [];
+            const activeSpans = [];
+
+            sourceRows.forEach((row, rowIndex) => {
+                if (!grid[rowIndex]) {
+                    grid[rowIndex] = [];
+                }
+
+                let columnIndex = 0;
+                while (activeSpans[columnIndex] && activeSpans[columnIndex].remaining > 0) {
+                    grid[rowIndex][columnIndex] = activeSpans[columnIndex].text;
+                    activeSpans[columnIndex].remaining -= 1;
+                    if (activeSpans[columnIndex].remaining <= 0) {
+                        activeSpans[columnIndex] = null;
+                    }
+                    columnIndex += 1;
+                }
+
+                const cells = Array.from(row.children).filter(cell => {
+                    const tag = (cell.tagName || '').toLowerCase();
+                    return tag === 'th' || tag === 'td';
+                });
+
+                cells.forEach(cell => {
+                    while (grid[rowIndex][columnIndex] !== undefined) {
+                        columnIndex += 1;
+                    }
+
+                    const text = getCellText(cell);
+                    const rowSpan = parseInt(cell.getAttribute('rowspan') || '1', 10);
+                    const colSpan = parseInt(cell.getAttribute('colspan') || '1', 10);
+
+                    for (let colOffset = 0; colOffset < colSpan; colOffset += 1) {
+                        grid[rowIndex][columnIndex + colOffset] = text;
+                        if (rowSpan > 1) {
+                            activeSpans[columnIndex + colOffset] = {
+                                text: text,
+                                remaining: rowSpan - 1
+                            };
+                        }
+                    }
+                    columnIndex += colSpan;
+
+                    while (activeSpans[columnIndex] && activeSpans[columnIndex].remaining > 0) {
+                        grid[rowIndex][columnIndex] = activeSpans[columnIndex].text;
+                        activeSpans[columnIndex].remaining -= 1;
+                        if (activeSpans[columnIndex].remaining <= 0) {
+                            activeSpans[columnIndex] = null;
+                        }
+                        columnIndex += 1;
+                    }
+                });
+            });
+
+            return grid
+                .map(row => row.map(cell => cleanText(cell || '')))
+                .filter(row => row.some(cell => cell));
+        }
+
+        function getCandidateTables(node) {
+            const candidates = [];
+            const seen = new Set();
+            let current = node;
+
+            while (current && current.nodeType === 1) {
+                let scopedTables = [];
+                const tag = (current.tagName || '').toLowerCase();
+                if (tag === 'table' || tag === 'grid' || current.getAttribute('role') === 'table' || current.getAttribute('role') === 'grid') {
+                    scopedTables.push(current);
+                }
+                scopedTables = scopedTables.concat(Array.from(current.querySelectorAll('table, [role="table"], [role="grid"]')));
+                scopedTables.forEach(table => {
+                    if (!seen.has(table)) {
+                        seen.add(table);
+                        candidates.push(table);
+                    }
+                });
+                current = current.parentElement;
+            }
+            return candidates;
+        }
+
+        function scoreTable(table, targetText) {
+            const rows = reconstructRows(table);
+            const tableText = getElementText(table);
+            let score = 0;
+            if (table === element) {
+                score += 150;
+            }
+            if (table.contains(element)) {
+                score += 100;
+            }
+            if (targetText && tableText.includes(targetText)) {
+                score += 20;
+            }
+            if (rows.some(row => row.some(cell => targetText && cell.includes(targetText)))) {
+                score += 40;
+            }
+            score += Math.min(rows.length, 20);
+            return { table, rows, score };
+        }
+
+        const targetText = getElementText(element);
+        const candidateTables = (elementIsTable ? [element] : getCandidateTables(element))
+            .map(table => scoreTable(table, targetText))
+            .sort((a, b) => b.score - a.score);
+
+        if (!candidateTables.length || candidateTables[0].score <= 0) {
+            return null;
+        }
+
+        const table = candidateTables[0].table;
+        const rows = candidateTables[0].rows;
+
+        let headers = [];
+        const headerCells = table.querySelectorAll('thead th');
+        if (headerCells.length) {
+            headers = Array.from(headerCells).map(cell => cleanText(cell.innerText || cell.textContent));
+        } else if (rows.length > 0) {
+            headers = rows[0];
+        }
+
+        const stableTableClasses = stableClasses(table);
+        const classXPath = stableTableClasses.length
+            ? `//${table.tagName.toLowerCase()}[` + stableTableClasses.map(token => `contains(@class,"${token}")`).join(' and ') + `]`
+            : '';
+
+        return {
+            tag: (table.tagName || '').toLowerCase(),
+            id: table.id || '',
+            classes: stableTableClasses,
+            xpath: buildXPath(table),
+            class_xpath: classXPath,
+            headers: headers,
+            rows: rows,
+            row_count: rows.length,
+            column_count: rows.reduce((maxCols, row) => Math.max(maxCols, row.length), 0),
+            anchor_text: targetText
+        };
+        """
+        try:
+            return self.driver.execute_script(script, element, element_is_table)
+        except WebDriverException:
+            return None
 
     def _click_with_fallback(self, element: WebElement) -> None:
         self._scroll_into_view(element)
