@@ -112,6 +112,8 @@ class EnterpriseDashboard(QMainWindow):
         self.expanded_text_registry = {}
         self.last_frame_downloads = []
         self.last_full_html_export = None
+        self.current_frame_html_content = ""
+        self.current_frame_view_label = ""
         self.init_ui()
         self.statusBar().showMessage("Ready. Use the Page Navigation panel to launch the browser.")
 
@@ -267,15 +269,21 @@ class EnterpriseDashboard(QMainWindow):
         find_all_btn.clicked.connect(self.find_all_versions_comprehensive)
         find_all_btn.setObjectName("accentButton")
         loc_layout.addWidget(find_all_btn, 1, 1)
-        click_element_btn = QPushButton("Click Element on Page")
-        click_element_btn.clicked.connect(self.enable_element_selection)
-        click_element_btn.setObjectName("secondaryButton")
-        loc_layout.addWidget(click_element_btn, 1, 2)
-        relative_xpath_btn = QPushButton("Build Relative XPath")
-        relative_xpath_btn.clicked.connect(self.enable_relative_xpath_selection)
-        relative_xpath_btn.setObjectName("secondaryButton")
-        relative_xpath_btn.setToolTip("Click the dynamic target first, then a stable reference element to build relative XPath options.")
-        loc_layout.addWidget(relative_xpath_btn, 2, 0, 1, 3)
+        self.click_element_btn = QPushButton("Click Element on Page")
+        self.click_element_btn.clicked.connect(self.enable_element_selection)
+        self.click_element_btn.setObjectName("secondaryButton")
+        loc_layout.addWidget(self.click_element_btn, 1, 2)
+        self.relative_xpath_btn = QPushButton("Build Relative XPath")
+        self.relative_xpath_btn.clicked.connect(self.enable_relative_xpath_selection)
+        self.relative_xpath_btn.setObjectName("secondaryButton")
+        self.relative_xpath_btn.setToolTip("Click the dynamic target first, then a stable reference element to build relative XPath options.")
+        loc_layout.addWidget(self.relative_xpath_btn, 2, 0, 1, 2)
+        self.cancel_selection_btn = QPushButton("Cancel Selection")
+        self.cancel_selection_btn.clicked.connect(lambda: self.cancel_element_selection(None))
+        self.cancel_selection_btn.setObjectName("secondaryButton")
+        self.cancel_selection_btn.setVisible(False)
+        self.cancel_selection_btn.setEnabled(False)
+        loc_layout.addWidget(self.cancel_selection_btn, 2, 2)
         loc_layout.setColumnStretch(0, 1)
         loc_layout.setColumnStretch(1, 1)
         loc_layout.setColumnStretch(2, 1)
@@ -451,32 +459,73 @@ class EnterpriseDashboard(QMainWindow):
         frame_page = QWidget()
         frame_layout = QVBoxLayout(frame_page)
         frame_layout.setContentsMargins(0, 0, 0, 0)
-        frame_layout.setSpacing(14)
+        frame_layout.setSpacing(10)
 
         frame_card = self._create_card("FrameCard")
         frame_card_layout = QVBoxLayout(frame_card)
         frame_card_layout.setContentsMargins(20, 20, 20, 20)
-        frame_card_layout.setSpacing(14)
+        frame_card_layout.setSpacing(8)
 
+        frame_header_layout = QHBoxLayout()
+        frame_header_layout.setSpacing(8)
         frame_title = QLabel("Downloaded Frame HTML")
         frame_title.setObjectName("sectionTitle")
+        frame_header_layout.addWidget(frame_title, 0)
         frame_hint = QLabel("Saved main document and iframe HTML snapshots are listed here.")
         frame_hint.setObjectName("sectionHint")
-        frame_hint.setWordWrap(True)
-        frame_card_layout.addWidget(frame_title)
-        frame_card_layout.addWidget(frame_hint)
-
-        frame_actions_layout = QHBoxLayout()
-        frame_actions_layout.setSpacing(10)
+        frame_hint.setWordWrap(False)
+        frame_header_layout.addWidget(frame_hint, 0)
+        frame_header_layout.addStretch(1)
         export_full_html_btn = QPushButton("Export Full HTML")
         export_full_html_btn.clicked.connect(self.export_full_html)
         export_full_html_btn.setObjectName("secondaryButton")
-        frame_actions_layout.addWidget(export_full_html_btn, 0)
-        frame_actions_layout.addStretch(1)
-        frame_card_layout.addLayout(frame_actions_layout)
+        frame_header_layout.addWidget(export_full_html_btn, 0)
+        refresh_frames_btn = QPushButton("Refresh")
+        refresh_frames_btn.clicked.connect(self.refresh_live_frame_selector)
+        refresh_frames_btn.setObjectName("secondaryButton")
+        frame_header_layout.addWidget(refresh_frames_btn, 0)
+        frame_card_layout.addLayout(frame_header_layout)
+
+        frame_controls_layout = QGridLayout()
+        frame_controls_layout.setHorizontalSpacing(8)
+        frame_controls_layout.setVerticalSpacing(8)
+        self.frame_selector_combo = QComboBox()
+        self.frame_selector_combo.setMinimumHeight(34)
+        self.frame_selector_combo.setMinimumWidth(260)
+        self.frame_selector_combo.setToolTip("Select a live frame or main document to preview/export directly.")
+        frame_controls_layout.addWidget(self.frame_selector_combo, 0, 0, 1, 1)
+        preview_selected_frame_btn = QPushButton("Preview")
+        preview_selected_frame_btn.clicked.connect(self.preview_selected_live_frame)
+        preview_selected_frame_btn.setObjectName("secondaryButton")
+        frame_controls_layout.addWidget(preview_selected_frame_btn, 0, 1)
+        export_selected_frame_btn = QPushButton("Export Frame")
+        export_selected_frame_btn.clicked.connect(self.export_selected_frame_html)
+        export_selected_frame_btn.setObjectName("secondaryButton")
+        frame_controls_layout.addWidget(export_selected_frame_btn, 0, 2)
+        self.frame_search_input = QLineEdit()
+        self.frame_search_input.setPlaceholderText("Search within the selected frame content")
+        self.frame_search_input.setMinimumHeight(34)
+        self.frame_search_input.returnPressed.connect(self.apply_frame_search)
+        frame_controls_layout.addWidget(self.frame_search_input, 1, 0, 1, 1)
+        frame_search_btn = QPushButton("Search")
+        frame_search_btn.clicked.connect(self.apply_frame_search)
+        frame_search_btn.setObjectName("secondaryButton")
+        frame_controls_layout.addWidget(frame_search_btn, 1, 1)
+        clear_frame_search_btn = QPushButton("Clear Search")
+        clear_frame_search_btn.clicked.connect(self.clear_frame_search)
+        clear_frame_search_btn.setObjectName("secondaryButton")
+        frame_controls_layout.addWidget(clear_frame_search_btn, 1, 2)
+        self.frame_search_status = QLabel("No frame content loaded.")
+        self.frame_search_status.setObjectName("sectionHint")
+        self.frame_search_status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        frame_controls_layout.addWidget(self.frame_search_status, 0, 3, 2, 1)
+        frame_controls_layout.setColumnStretch(0, 1)
+        frame_card_layout.addLayout(frame_controls_layout)
 
         self.frame_download_list = QListWidget()
         self.frame_download_list.itemClicked.connect(self._handle_frame_download_selection)
+        self.frame_download_list.setMaximumHeight(88)
+        self.frame_download_list.setVisible(False)
         frame_card_layout.addWidget(self.frame_download_list)
 
         self.frame_html_viewer = QTextBrowser()
@@ -768,6 +817,8 @@ class EnterpriseDashboard(QMainWindow):
             self.locator_tester_nav_button.setChecked(current_index == self.tester_tab_index)
         if hasattr(self, 'frames_nav_button') and hasattr(self, 'frame_tab_index'):
             self.frames_nav_button.setChecked(current_index == self.frame_tab_index)
+            if current_index == self.frame_tab_index:
+                self.refresh_live_frame_selector()
         if hasattr(self, 'output_nav_button') and hasattr(self, 'output_tab_index'):
             self.output_nav_button.setChecked(self.output_nav_button.isEnabled() and current_index == self.output_tab_index)
         if hasattr(self, 'table_grid_nav_button') and hasattr(self, 'table_grid_tab_index'):
@@ -1022,9 +1073,10 @@ class EnterpriseDashboard(QMainWindow):
         """Render downloaded frame HTML locations in the list tab."""
         self.frame_download_list.clear()
         if not downloads:
-            self.frame_download_list.addItem("No frame HTML downloads yet.")
+            self.frame_download_list.setVisible(False)
             return
 
+        self.frame_download_list.setVisible(True)
         for entry in downloads:
             label = f"{entry['frame_label']} -> {entry['file_path']}"
             if entry.get('is_target'):
@@ -1033,24 +1085,177 @@ class EnterpriseDashboard(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, entry.get('file_path'))
             self.frame_download_list.addItem(item)
 
+    def refresh_live_frame_selector(self):
+        """List the main document and reachable frames for live preview/export."""
+        if not hasattr(self, 'frame_selector_combo'):
+            return
+
+        self.frame_selector_combo.clear()
+        if not self.driver:
+            self.frame_selector_combo.addItem("Browser not launched")
+            self.frame_selector_combo.setEnabled(False)
+            return
+
+        self.frame_selector_combo.setEnabled(True)
+        for frame_path in self._get_selection_context_paths():
+            frame_label = self._format_frame_path(frame_path)
+            self.frame_selector_combo.addItem(frame_label, list(frame_path))
+
+    def _capture_frame_html(self, frame_path):
+        """Capture the current HTML for a specific frame path."""
+        if not self.ensure_driver():
+            return None, None
+
+        try:
+            self._switch_to_frame_path(frame_path or [])
+            html_content = self.driver.page_source
+            return html_content, self._format_frame_path(frame_path or [])
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+
+    def _set_frame_view_content(self, html_content, source_label):
+        """Store frame content and render it in the Frames viewer."""
+        self.current_frame_html_content = html_content or ""
+        self.current_frame_view_label = source_label or "Frame Content"
+        if hasattr(self, 'frame_search_input'):
+            self.frame_search_input.clear()
+        self._render_frame_html_viewer()
+
+    def _render_frame_html_viewer(self):
+        """Render current frame content with optional highlighted search matches."""
+        if not hasattr(self, 'frame_html_viewer'):
+            return
+
+        raw_text = self.current_frame_html_content or ""
+        source_label = self.current_frame_view_label or "Frame Content"
+        search_term = self.frame_search_input.text().strip() if hasattr(self, 'frame_search_input') else ""
+
+        if not raw_text:
+            self.frame_html_viewer.setPlainText("No frame content loaded.")
+            if hasattr(self, 'frame_search_status'):
+                self.frame_search_status.setText("No frame content loaded.")
+            return
+
+        match_count = 0
+        if search_term:
+            pattern = re.compile(re.escape(search_term), re.IGNORECASE)
+            parts = []
+            last_index = 0
+            for match in pattern.finditer(raw_text):
+                parts.append(html.escape(raw_text[last_index:match.start()]))
+                parts.append(
+                    "<span style=\"background-color: #fde68a; color: #92400e; font-weight: 700;\">"
+                    f"{html.escape(match.group(0))}"
+                    "</span>"
+                )
+                last_index = match.end()
+                match_count += 1
+            parts.append(html.escape(raw_text[last_index:]))
+            body_html = "".join(parts)
+        else:
+            body_html = html.escape(raw_text)
+
+        self.frame_html_viewer.setHtml(
+            "<div style=\"font-family: Consolas, 'Courier New', monospace; font-size: 12px; color: #0f172a;\">"
+            f"<div style=\"margin-bottom: 10px; font-weight: 700; color: #1e3a8a;\">{html.escape(source_label)}</div>"
+            f"<pre style=\"white-space: pre-wrap; word-break: break-word; margin: 0;\">{body_html}</pre>"
+            "</div>"
+        )
+        if hasattr(self, 'frame_search_status'):
+            if search_term:
+                self.frame_search_status.setText(f"{match_count} match(es) highlighted in {source_label}.")
+            else:
+                self.frame_search_status.setText(f"Viewing {source_label}.")
+
+    def apply_frame_search(self):
+        """Search within the currently loaded frame content and highlight matches."""
+        self._render_frame_html_viewer()
+
+    def clear_frame_search(self):
+        """Clear the current frame search and remove highlights."""
+        if hasattr(self, 'frame_search_input'):
+            self.frame_search_input.clear()
+        self._render_frame_html_viewer()
+
     def _show_html_in_frame_viewer(self, file_path):
         """Load HTML file contents into the Frames tab viewer."""
         if not file_path or not os.path.exists(file_path):
+            self.current_frame_html_content = ""
+            self.current_frame_view_label = ""
             self.frame_html_viewer.setPlainText("HTML file not found.")
+            if hasattr(self, 'frame_search_status'):
+                self.frame_search_status.setText("HTML file not found.")
             return
 
         try:
             with open(file_path, 'r', encoding='utf-8') as file_handle:
                 html_content = file_handle.read()
-            self.frame_html_viewer.setPlainText(html_content)
+            self._set_frame_view_content(html_content, os.path.basename(file_path))
         except Exception as exc:
+            self.current_frame_html_content = ""
+            self.current_frame_view_label = ""
             self.frame_html_viewer.setPlainText(f"Failed to load HTML: {str(exc)}")
+            if hasattr(self, 'frame_search_status'):
+                self.frame_search_status.setText("Failed to load HTML.")
 
     def _handle_frame_download_selection(self, item):
         """Preview the selected frame HTML file in the Frames tab."""
         file_path = item.data(Qt.ItemDataRole.UserRole)
         if file_path:
             self._show_html_in_frame_viewer(file_path)
+
+    def preview_selected_live_frame(self):
+        """Load the selected live frame directly into the in-app viewer."""
+        if not self.ensure_driver():
+            return
+
+        frame_path = self.frame_selector_combo.currentData()
+        html_content, frame_label = self._capture_frame_html(frame_path or [])
+        if html_content is None:
+            self.frame_html_viewer.setPlainText("Failed to capture frame HTML.")
+            if hasattr(self, 'frame_search_status'):
+                self.frame_search_status.setText("Failed to capture frame HTML.")
+            return
+        self._set_frame_view_content(html_content, f"Live Preview: {frame_label}")
+        if hasattr(self, 'workspace_tabs') and hasattr(self, 'frame_tab_index'):
+            self.workspace_tabs.setCurrentIndex(self.frame_tab_index)
+
+    def export_selected_frame_html(self):
+        """Export the selected live frame HTML and load it into the Frames tab."""
+        if not self.ensure_driver():
+            return
+
+        frame_path = self.frame_selector_combo.currentData()
+        html_content, frame_label = self._capture_frame_html(frame_path or [])
+        if html_content is None:
+            self.frame_html_viewer.setPlainText("Failed to export selected frame HTML.")
+            if hasattr(self, 'frame_search_status'):
+                self.frame_search_status.setText("Failed to export selected frame HTML.")
+            return
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        export_dir = self._get_export_directory()
+        safe_frame_name = self._sanitize_filename_part(frame_label.replace(' > ', '_'), 'main_document')
+        file_path = os.path.join(export_dir, f"{safe_frame_name}_{timestamp}.html")
+        try:
+            with open(file_path, 'w', encoding='utf-8') as file_handle:
+                file_handle.write(html_content)
+            entry = {
+                'frame_label': frame_label,
+                'file_path': file_path,
+                'is_target': False,
+            }
+            self.last_frame_downloads.insert(0, entry)
+            self._populate_frame_download_list(self.last_frame_downloads)
+            self._set_frame_view_content(html_content, f"Exported: {frame_label}")
+            self.statusBar().showMessage(f"Selected frame exported to {file_path}")
+        except Exception as exc:
+            self.frame_html_viewer.setPlainText(f"Failed to export selected frame HTML: {str(exc)}")
+            if hasattr(self, 'frame_search_status'):
+                self.frame_search_status.setText("Failed to export selected frame HTML.")
 
     def _download_frame_htmls(self, target_frame_path=None):
         """Download HTML for the main document and all reachable frames, marking the target frame."""
@@ -1203,19 +1408,20 @@ class EnterpriseDashboard(QMainWindow):
             for row in self._build_analyze_locator_rows(snapshot, context)
         ]
 
-    def _add_locator_row(self, rows, seen, locator_type, locator_value):
+    def _add_locator_row(self, rows, seen, locator_type, locator_value, frame_label=None):
         """Append a locator row once so outputs stay deduplicated."""
         locator_type = (locator_type or '').strip()
         locator_value = (locator_value or '').strip()
         if not locator_type or not locator_value:
             return
-        key = (locator_type, locator_value)
+        frame_label = (frame_label or '').strip() or '-'
+        key = (locator_type, locator_value, frame_label)
         if key in seen:
             return
-        rows.append({"type": locator_type, "value": locator_value})
+        rows.append({"type": locator_type, "value": locator_value, "frame": frame_label})
         seen.add(key)
 
-    def _build_analyze_locator_rows(self, snapshot, context):
+    def _build_analyze_locator_rows(self, snapshot, context, frame_label='-'):
         """Build structured locator rows for Analyze Locator output."""
         tag = (snapshot.get('tag') or '*').lower()
         text = (snapshot.get('text') or '').strip()
@@ -1237,76 +1443,89 @@ class EnterpriseDashboard(QMainWindow):
                 rows,
                 seen,
                 "XPath Text",
-                f"//{tag}[contains(normalize-space(.),{self._escape_xpath_text(text[:30])})]"
+                f"//{tag}[contains(normalize-space(.),{self._escape_xpath_text(text[:30])})]",
+                frame_label
             )
             self._add_locator_row(
                 rows,
                 seen,
                 "XPath Text Exact",
-                f"//{tag}[normalize-space(.)={self._escape_xpath_text(text[:60])}]"
+                f"//{tag}[normalize-space(.)={self._escape_xpath_text(text[:60])}]",
+                frame_label
             )
             if tag == 'a':
-                self._add_locator_row(rows, seen, "Link Text", text[:100])
-                self._add_locator_row(rows, seen, "Partial Link Text", text[:30])
+                self._add_locator_row(rows, seen, "Link Text", text[:100], frame_label)
+                self._add_locator_row(rows, seen, "Partial Link Text", text[:30], frame_label)
 
         if elem_value:
-            self._add_locator_row(rows, seen, "XPath Value", f"//{tag}[@value={self._escape_xpath_text(elem_value)}]")
+            self._add_locator_row(rows, seen, "XPath Value", f"//{tag}[@value={self._escape_xpath_text(elem_value)}]", frame_label)
 
         if elem_id:
-            self._add_locator_row(rows, seen, "ID", elem_id)
-            self._add_locator_row(rows, seen, "CSS ID", f"#{elem_id}")
+            self._add_locator_row(rows, seen, "ID", elem_id, frame_label)
+            self._add_locator_row(rows, seen, "CSS ID", f"#{elem_id}", frame_label)
             self._add_locator_row(
                 rows,
                 seen,
                 "XPath ID",
-                f"//{tag}[@id={self._escape_xpath_text(elem_id)}]"
+                f"//{tag}[@id={self._escape_xpath_text(elem_id)}]",
+                frame_label
             )
 
         if elem_name:
-            self._add_locator_row(rows, seen, "Name", elem_name)
+            self._add_locator_row(rows, seen, "Name", elem_name, frame_label)
             self._add_locator_row(
                 rows,
                 seen,
                 "XPath Name",
-                f"//{tag}[@name={self._escape_xpath_text(elem_name)}]"
+                f"//{tag}[@name={self._escape_xpath_text(elem_name)}]",
+                frame_label
             )
 
         if elem_href:
-            self._add_locator_row(rows, seen, "Href", elem_href)
-            self._add_locator_row(rows, seen, "CSS Href", f"{tag}[href='{elem_href}']")
-            self._add_locator_row(rows, seen, "XPath Href", f"//{tag}[@href={self._escape_xpath_text(elem_href)}]")
+            self._add_locator_row(rows, seen, "Href", elem_href, frame_label)
+            self._add_locator_row(rows, seen, "CSS Href", f"{tag}[href='{elem_href}']", frame_label)
+            self._add_locator_row(rows, seen, "XPath Href", f"//{tag}[@href={self._escape_xpath_text(elem_href)}]", frame_label)
 
         if elem_title:
-            self._add_locator_row(rows, seen, "Title", elem_title)
-            self._add_locator_row(rows, seen, "CSS Title", f"{tag}[title='{elem_title}']")
-            self._add_locator_row(rows, seen, "XPath Title", f"//{tag}[@title={self._escape_xpath_text(elem_title)}]")
+            self._add_locator_row(rows, seen, "Title", elem_title, frame_label)
+            self._add_locator_row(rows, seen, "CSS Title", f"{tag}[title='{elem_title}']", frame_label)
+            self._add_locator_row(rows, seen, "XPath Title", f"//{tag}[@title={self._escape_xpath_text(elem_title)}]", frame_label)
 
         if stable_classes:
             class_conditions = " and ".join(
                 f"contains(@class,{self._escape_xpath_text(class_token)})" for class_token in stable_classes[:2]
             )
             first_class = stable_classes[0]
-            self._add_locator_row(rows, seen, "Class Name", first_class)
-            self._add_locator_row(rows, seen, "CSS Class", f".{first_class}")
-            self._add_locator_row(rows, seen, "Class Auto", f"{tag}.{first_class}")
-            self._add_locator_row(rows, seen, "CSS Tag.Class", f"{tag}.{first_class}")
-            self._add_locator_row(rows, seen, "XPath Class", f"//{tag}[{class_conditions}]")
+            self._add_locator_row(rows, seen, "Class Name", first_class, frame_label)
+            self._add_locator_row(rows, seen, "CSS Class", f".{first_class}", frame_label)
+            self._add_locator_row(rows, seen, "Class Auto", f"{tag}.{first_class}", frame_label)
+            self._add_locator_row(rows, seen, "CSS Tag.Class", f"{tag}.{first_class}", frame_label)
+            self._add_locator_row(rows, seen, "XPath Class", f"//{tag}[{class_conditions}]", frame_label)
 
         dynamic_candidates = self._build_dynamic_xpath_candidates(context or {})
         for candidate in dynamic_candidates:
             if "following-sibling::" in candidate:
-                self._add_locator_row(rows, seen, "Stable XPath From Previous Sibling", candidate)
+                self._add_locator_row(rows, seen, "Stable XPath From Previous Sibling", candidate, frame_label)
             elif "preceding-sibling::" in candidate:
-                self._add_locator_row(rows, seen, "Stable XPath From Next Sibling", candidate)
+                self._add_locator_row(rows, seen, "Stable XPath From Next Sibling", candidate, frame_label)
             else:
-                self._add_locator_row(rows, seen, "Stable XPath", candidate)
+                self._add_locator_row(rows, seen, "Stable XPath", candidate, frame_label)
 
         for option in self._build_locator_result_options(context or {}):
             locator_type, locator_value = option.split(": ", 1) if ": " in option else ("Locator", option)
-            self._add_locator_row(rows, seen, locator_type, locator_value)
+            self._add_locator_row(rows, seen, locator_type, locator_value, frame_label)
+
+        if getattr(self, "archer_mode_btn", None) and self.archer_mode_btn.isChecked():
+            archer_seed = text or elem_id or elem_name or elem_href or elem_title
+            if archer_seed:
+                for rule_name, rule_type, rule_value in build_archer_strategy_rules(
+                    archer_seed,
+                    self._escape_xpath_text
+                ):
+                    self._add_locator_row(rows, seen, f"{rule_type} | {rule_name}", rule_value, frame_label)
         return rows
 
-    def _build_selected_element_locator_rows(self, element_data):
+    def _build_selected_element_locator_rows(self, element_data, frame_label='-'):
         """Build structured locator rows for selected element output."""
         rows = []
         seen = set()
@@ -1322,46 +1541,45 @@ class EnterpriseDashboard(QMainWindow):
         xpath = (element_data.get('xpath') or '').strip()
 
         if xpath:
-            self._add_locator_row(rows, seen, "XPath", xpath)
+            self._add_locator_row(rows, seen, "XPath", xpath, frame_label)
         if text:
-            self._add_locator_row(rows, seen, "XPath Text", f"//{tag}[contains(text(),'{text[:30]}')]")
-            self._add_locator_row(rows, seen, "XPath Text Exact", f"//{tag}[normalize-space(.)={self._escape_xpath_text(text[:60])}]")
+            self._add_locator_row(rows, seen, "XPath Text", f"//{tag}[contains(text(),'{text[:30]}')]", frame_label)
+            self._add_locator_row(rows, seen, "XPath Text Exact", f"//{tag}[normalize-space(.)={self._escape_xpath_text(text[:60])}]", frame_label)
             if tag == 'a':
-                self._add_locator_row(rows, seen, "Link Text", text[:100])
-                self._add_locator_row(rows, seen, "Partial Link Text", text[:30])
+                self._add_locator_row(rows, seen, "Link Text", text[:100], frame_label)
+                self._add_locator_row(rows, seen, "Partial Link Text", text[:30], frame_label)
         if elem_id:
-            self._add_locator_row(rows, seen, "ID", elem_id)
-            self._add_locator_row(rows, seen, "CSS ID", f"#{elem_id}")
+            self._add_locator_row(rows, seen, "ID", elem_id, frame_label)
+            self._add_locator_row(rows, seen, "CSS ID", f"#{elem_id}", frame_label)
         if elem_name:
-            self._add_locator_row(rows, seen, "Name", elem_name)
+            self._add_locator_row(rows, seen, "Name", elem_name, frame_label)
         stable_classes = self._stable_class_tokens(elem_class)
         if stable_classes:
             first_class = stable_classes[0]
-            self._add_locator_row(rows, seen, "Class Name", first_class)
-            self._add_locator_row(rows, seen, "CSS Class", f".{first_class}")
-            self._add_locator_row(rows, seen, "Class Auto", f"{tag}.{first_class}")
-            self._add_locator_row(rows, seen, "CSS Tag.Class", f"{tag}.{first_class}")
+            self._add_locator_row(rows, seen, "Class Name", first_class, frame_label)
+            self._add_locator_row(rows, seen, "CSS Class", f".{first_class}", frame_label)
+            self._add_locator_row(rows, seen, "Class Auto", f"{tag}.{first_class}", frame_label)
+            self._add_locator_row(rows, seen, "CSS Tag.Class", f"{tag}.{first_class}", frame_label)
         if elem_value:
-            self._add_locator_row(rows, seen, "Value", elem_value)
-            self._add_locator_row(rows, seen, "XPath Value", f"//{tag}[@value={self._escape_xpath_text(elem_value)}]")
+            self._add_locator_row(rows, seen, "Value", elem_value, frame_label)
+            self._add_locator_row(rows, seen, "XPath Value", f"//{tag}[@value={self._escape_xpath_text(elem_value)}]", frame_label)
         if elem_type:
-            self._add_locator_row(rows, seen, "Type", f"[{elem_type}]")
+            self._add_locator_row(rows, seen, "Type", f"[{elem_type}]", frame_label)
         if href:
-            self._add_locator_row(rows, seen, "Href", href)
-            self._add_locator_row(rows, seen, "CSS Href", f"{tag}[href='{href}']")
-            self._add_locator_row(rows, seen, "XPath Href", f"//{tag}[@href={self._escape_xpath_text(href)}]")
-            self._add_locator_row(rows, seen, "Link", f"a[href='{href}']")
+            self._add_locator_row(rows, seen, "Href", href, frame_label)
+            self._add_locator_row(rows, seen, "CSS Href", f"{tag}[href='{href}']", frame_label)
+            self._add_locator_row(rows, seen, "XPath Href", f"//{tag}[@href={self._escape_xpath_text(href)}]", frame_label)
+            self._add_locator_row(rows, seen, "Link", f"a[href='{href}']", frame_label)
         if title:
-            self._add_locator_row(rows, seen, "Title", title)
-            self._add_locator_row(rows, seen, "CSS Title", f"{tag}[title='{title}']")
-            self._add_locator_row(rows, seen, "XPath Title", f"//{tag}[@title={self._escape_xpath_text(title)}]")
+            self._add_locator_row(rows, seen, "Title", title, frame_label)
+            self._add_locator_row(rows, seen, "CSS Title", f"{tag}[title='{title}']", frame_label)
+            self._add_locator_row(rows, seen, "XPath Title", f"//{tag}[@title={self._escape_xpath_text(title)}]", frame_label)
         return rows
 
-    def _append_locator_rows_table(self, locator_rows):
-        """Render locator rows into the output panel as a copy-friendly table."""
+    def _build_locator_table_html(self, locator_rows, margin_top="8px"):
+        """Build a copy-friendly locator table with frame awareness."""
         if not locator_rows:
-            self.output.append("<div style=\"margin-left: 12px;\">No locator options found.</div>")
-            return
+            return "<div style=\"margin-top: 8px; color: #475569;\">No locator options found.</div>"
         row_html = []
         for index, row in enumerate(locator_rows, 1):
             row_bg = "#f8fafc" if index % 2 else "#eff6ff"
@@ -1369,15 +1587,17 @@ class EnterpriseDashboard(QMainWindow):
                 f"<tr style=\"background-color: {row_bg};\">"
                 f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; vertical-align: top; color: #0f172a;\">{html.escape(row['type'])}</td>"
                 f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; vertical-align: top; color: #0f172a; font-family: Consolas, 'Courier New', monospace;\">{html.escape(row['value'])}</td>"
+                f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; vertical-align: top; color: #0f172a;\">{html.escape(row.get('frame') or '-')}</td>"
                 f"</tr>"
             )
-        self.output.append(
-            """
-            <table style="width: 100%; border-collapse: collapse; margin-left: 12px; margin-top: 4px; font-size: 12px;">
+        return (
+            f"""
+            <table style="width: 100%; border-collapse: collapse; margin-top: {margin_top}; font-size: 12px;">
                 <thead>
                     <tr style="background-color: #1e3a8a; color: #ffffff;">
                         <th style="border: 1px solid #93c5fd; padding: 7px 8px; text-align: left;">Type</th>
                         <th style="border: 1px solid #93c5fd; padding: 7px 8px; text-align: left;">Locator Value Identified</th>
+                        <th style="border: 1px solid #93c5fd; padding: 7px 8px; text-align: left;">Frame Path</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -1389,9 +1609,37 @@ class EnterpriseDashboard(QMainWindow):
             """
         )
 
-    def _render_tester_locator_results_html(self, heading, attempt_logs, info_lines, locator_rows):
-        """Render tester locator results using an HTML table for easier copying."""
-        log_html = "<br>".join(html.escape(line) for line in ([heading, ""] + (attempt_logs or ["No attempts were recorded."])))
+    def _append_locator_rows_table(self, locator_rows):
+        """Render locator rows into the output panel as a copy-friendly table."""
+        if not locator_rows:
+            self.output.append("<div style=\"margin-left: 12px;\">No locator options found.</div>")
+            return
+        self.output.append(self._build_locator_table_html(locator_rows, margin_top="4px"))
+
+    def _build_locator_results_html(self, heading, attempt_logs, info_lines, locator_rows=None, locator_sections=None):
+        """Build a structured HTML result block with numbered logs and locator rows."""
+        log_rows = []
+        for index, line in enumerate(attempt_logs or ["No attempts were recorded."], 1):
+            row_bg = "#f8fafc" if index % 2 else "#eff6ff"
+            log_rows.append(
+                f"<tr style=\"background-color: {row_bg};\">"
+                f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; width: 56px; vertical-align: top; color: #0f172a;\">{index}</td>"
+                f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; vertical-align: top; color: #0f172a;\">{html.escape(line)}</td>"
+                f"</tr>"
+            )
+        log_html = (
+            "<table style=\"width: 100%; border-collapse: collapse; font-size: 12px;\">"
+            "<thead>"
+            "<tr style=\"background-color: #0f766e; color: #ffffff;\">"
+            "<th style=\"border: 1px solid #99f6e4; padding: 7px 8px; text-align: left;\">#</th>"
+            "<th style=\"border: 1px solid #99f6e4; padding: 7px 8px; text-align: left;\">Log Entry</th>"
+            "</tr>"
+            "</thead>"
+            "<tbody>"
+            + "".join(log_rows) +
+            "</tbody>"
+            "</table>"
+        )
 
         info_html = ""
         if info_lines:
@@ -1406,41 +1654,51 @@ class EnterpriseDashboard(QMainWindow):
                 "</div>"
             )
 
-        if locator_rows:
-            row_html = []
-            for index, row in enumerate(locator_rows, 1):
-                row_bg = "#f8fafc" if index % 2 else "#eff6ff"
-                row_html.append(
-                    f"<tr style=\"background-color: {row_bg};\">"
-                    f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; vertical-align: top; color: #0f172a;\">{html.escape(row['type'])}</td>"
-                    f"<td style=\"border: 1px solid #bfdbfe; padding: 6px 8px; vertical-align: top; color: #0f172a; font-family: Consolas, 'Courier New', monospace;\">{html.escape(row['value'])}</td>"
-                    f"</tr>"
-                )
-            locator_table_html = (
-                "<table style=\"width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px;\">"
-                "<thead>"
-                "<tr style=\"background-color: #1e3a8a; color: #ffffff;\">"
-                "<th style=\"border: 1px solid #93c5fd; padding: 7px 8px; text-align: left;\">Type</th>"
-                "<th style=\"border: 1px solid #93c5fd; padding: 7px 8px; text-align: left;\">Locator Value Identified</th>"
-                "</tr>"
-                "</thead>"
-                "<tbody>"
-                + "".join(row_html) +
-                "</tbody>"
-                "</table>"
+        sections = locator_sections if locator_sections is not None else [
+            {"title": "Locator Results", "rows": locator_rows or []}
+        ]
+        section_html = []
+        for section in sections:
+            section_html.append(
+                f"<div style=\"font-weight: 700; margin-top: 12px; margin-bottom: 6px;\">{html.escape(section.get('title') or 'Locator Results')}</div>"
+                f"{self._build_locator_table_html(section.get('rows') or [], margin_top='8px')}"
             )
-        else:
-            locator_table_html = "<div style=\"margin-top: 8px; color: #475569;\">No locator options found.</div>"
 
-        self.test_result_display.setHtml(
+        return (
             "<div style=\"font-family: Segoe UI, Arial, sans-serif; color: #0f172a;\">"
             f"<div style=\"font-weight: 700; margin-bottom: 8px;\">{html.escape(heading)}</div>"
             f"<div style=\"padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background-color: #ffffff;\">{log_html}</div>"
             f"{info_html}"
-            "<div style=\"font-weight: 700; margin-top: 12px; margin-bottom: 6px;\">Locator Results</div>"
-            f"{locator_table_html}"
+            + "".join(section_html) +
             "</div>"
         )
+
+    def _render_tester_locator_results_html(self, heading, attempt_logs, info_lines, locator_rows):
+        """Render tester locator results using an HTML table for easier copying."""
+        self.test_result_display.setHtml(
+            self._build_locator_results_html(heading, attempt_logs, info_lines, locator_rows)
+        )
+
+    def _render_output_locator_results_html(self, heading, attempt_logs, info_lines, locator_rows):
+        """Render locator results into the main Output panel."""
+        self.output.setHtml(
+            self._build_locator_results_html(heading, attempt_logs, info_lines, locator_rows)
+        )
+        if hasattr(self, "workspace_tabs") and hasattr(self, "output_tab_index"):
+            self.workspace_tabs.setCurrentIndex(self.output_tab_index)
+
+    def _render_output_locator_sections_html(self, heading, attempt_logs, info_lines, locator_sections):
+        """Render multi-section locator results into the main Output panel."""
+        self.output.setHtml(
+            self._build_locator_results_html(
+                heading,
+                attempt_logs,
+                info_lines,
+                locator_sections=locator_sections,
+            )
+        )
+        if hasattr(self, "workspace_tabs") and hasattr(self, "output_tab_index"):
+            self.workspace_tabs.setCurrentIndex(self.output_tab_index)
 
     def analyze_locator(self):
         if not self.ensure_driver():
@@ -1453,15 +1711,15 @@ class EnterpriseDashboard(QMainWindow):
 
         self._set_processing_status(True, "Analyzing locator ...")
         try:
-            self.bg_color_toggle = not self.bg_color_toggle
-            bg_marker = "[A]" if self.bg_color_toggle else "[B]"
-
-            self.output.append(f"\n{bg_marker} " + "=" * 98)
-            self.output.append(f"ANALYZING: {locator_input}")
-            self.output.append("=" * 100)
-
             locator_type = "XPath" if locator_input.startswith("//") else "Auto-Detect"
             attempt_logs = []
+            archer_rules = []
+            if getattr(self, "archer_mode_btn", None) and self.archer_mode_btn.isChecked():
+                archer_rules = list(build_archer_strategy_rules(locator_input, self._escape_xpath_text))
+                self._append_attempt_log(
+                    attempt_logs,
+                    f"Archer Mode is ON. Added {len(archer_rules)} Archer-specific locator rule(s) before standard strategies."
+                )
             element, strategy_used, strategy_value_used, frame_path = self.try_locator_with_strategy(
                 locator_input,
                 locator_type,
@@ -1471,8 +1729,12 @@ class EnterpriseDashboard(QMainWindow):
             if element:
                 by_strategy = self.get_locator_strategy(strategy_used, strategy_value_used)
                 if not by_strategy:
-                    self.output.append("Matched element, but could not rebuild locator strategy for analysis.")
-                    self.output.append("=" * 100)
+                    self._render_output_locator_results_html(
+                        "Analyze Locator",
+                        attempt_logs,
+                        ["FAILED - Matched element, but could not rebuild locator strategy for analysis."],
+                        [],
+                    )
                     return
 
                 by_type, by_value = by_strategy
@@ -1486,51 +1748,99 @@ class EnterpriseDashboard(QMainWindow):
                     ),
                     timeout=4
                 )
-
-                self.output.append(f"Found via {strategy_used}")
+                frame_label = self._format_frame_path(frame_path or [])
+                info_lines = [
+                    "SUCCESS - Element Found!",
+                    f"Strategy Used: {strategy_used}",
+                    f"Tag: <{snapshot.get('tag') or '-'}>",
+                    f"ID: {snapshot.get('id') or '(none)'}",
+                    f"Name: {snapshot.get('name') or '(none)'}",
+                    f"Class: {snapshot.get('class') or '(none)'}",
+                    f"Href: {snapshot.get('href') or '(none)'}",
+                    f"Title: {snapshot.get('title') or '(none)'}",
+                    f"Text: {(snapshot.get('text') or '(none)')[:60]}",
+                    f"Frame: {frame_label}",
+                ]
                 if strategy_used == "XPath" and strategy_value_used != locator_input:
-                    self.output.append(f"  (Auto-corrected: {strategy_value_used})")
+                    info_lines.append(f"Auto-corrected XPath: {strategy_value_used}")
+                if archer_rules:
+                    info_lines.append(f"Archer Mode: ON")
+                    info_lines.append(f"Archer Rules Attempted: {len(archer_rules)}")
+                    if " | " in (strategy_used or ""):
+                        _, matched_archer_rule = strategy_used.split(" | ", 1)
+                        info_lines.append(f"First Archer Match: {matched_archer_rule}")
+                    else:
+                        info_lines.append("First Archer Match: none")
 
-                self.output.append("\nELEMENT INFO:")
-                self.output.append(f"  Tag: <{snapshot.get('tag') or '-'}>")
-                self.output.append(f"  ID: {snapshot.get('id') or '(none)'}")
-                self.output.append(f"  Name: {snapshot.get('name') or '(none)'}")
-                self.output.append(f"  Class: {snapshot.get('class') or '(none)'}")
-                self.output.append(f"  Href: {snapshot.get('href') or '(none)'}")
-                self.output.append(f"  Title: {snapshot.get('title') or '(none)'}")
-                self.output.append(f"  Text: {(snapshot.get('text') or '(none)')[:60]}")
-                self.output.append(f"  Frame: {self._format_frame_path(frame_path or [])}")
-
-                self.output.append("\nLOCATOR OPTIONS:")
-                locator_rows = self._build_analyze_locator_rows(snapshot, context)
-                self._append_locator_rows_table(locator_rows)
-
+                locator_rows = self._build_analyze_locator_rows(snapshot, context, frame_label=frame_label)
                 self._refresh_frame_downloads_for_match(frame_path)
-                if hasattr(self, 'workspace_tabs') and hasattr(self, 'output_tab_index'):
-                    self.workspace_tabs.setCurrentIndex(self.output_tab_index)
-                self.output.append("=" * 100)
+                self._render_output_locator_results_html("Analyze Locator", attempt_logs, info_lines, locator_rows)
             else:
-                self.output.append("Element not found in main document or nested iframes. Try with different format.")
-                if hasattr(self, 'workspace_tabs') and hasattr(self, 'output_tab_index'):
-                    self.workspace_tabs.setCurrentIndex(self.output_tab_index)
-                self.output.append("=" * 100)
+                info_lines = ["FAILED - Element not found in main document or nested iframes. Try with different format."]
+                if archer_rules:
+                    info_lines.append("Archer Mode: ON")
+                    info_lines.append(f"Archer Rules Attempted: {len(archer_rules)}")
+                    info_lines.append("First Archer Match: none")
+                self._render_output_locator_results_html("Analyze Locator", attempt_logs, info_lines, [])
         finally:
             self._set_processing_status(False, "Locator analysis finished")
 
+    def _set_selection_buttons_state(self, active_mode=None):
+        """Keep selection buttons in sync with the active page-pick mode."""
+        is_active = bool(active_mode)
+        if hasattr(self, "click_element_btn"):
+            self.click_element_btn.setEnabled(not is_active or active_mode == "single")
+            self.click_element_btn.setText("Selecting..." if active_mode == "single" else "Click Element on Page")
+        if hasattr(self, "relative_xpath_btn"):
+            self.relative_xpath_btn.setEnabled(not is_active or active_mode == "relative")
+            self.relative_xpath_btn.setText("Selecting..." if active_mode == "relative" else "Build Relative XPath")
+        if hasattr(self, "cancel_selection_btn"):
+            self.cancel_selection_btn.setVisible(is_active)
+            self.cancel_selection_btn.setEnabled(is_active)
+
+    def _get_selection_context_paths(self):
+        """Return the document/frame contexts used for selector injection and cleanup."""
+        try:
+            return self._collect_frame_paths()
+        except Exception:
+            return [[]]
+
+    def _run_script_in_selection_contexts(self, script):
+        """Execute a selector script in the main document and reachable frames."""
+        executed_count = 0
+        for frame_path in self._get_selection_context_paths():
+            try:
+                self._switch_to_frame_path(frame_path)
+                self.driver.execute_script(script)
+                executed_count += 1
+            except Exception:
+                continue
+            finally:
+                self.driver.switch_to.default_content()
+        return executed_count
+
+    def _begin_selection_mode(self, mode, js_code, header_lines, ready_message, tester_message=None):
+        """Start a selection mode using shared setup and context injection."""
+        self.cleanup_element_selector()
+        self.selection_mode = mode
+        self.relative_selection_progress = None
+        self._set_selection_buttons_state(mode)
+        for line in header_lines:
+            self.output.append(line)
+        try:
+            injected_count = self._run_script_in_selection_contexts(js_code)
+            if tester_message:
+                self.test_result_display.setText(tester_message)
+            self.output.append(ready_message.format(injected_count=injected_count))
+            self._start_element_selection_polling()
+        except Exception as e:
+            self.output.append(f"Failed to enable selector: {str(e)}")
+            self.cleanup_element_selector()
 
     def enable_element_selection(self):
         """Enable clicking elements on the page to get locators across frames."""
         if not self.ensure_driver():
             return
-
-        self.selection_mode = "single"
-        self.relative_selection_progress = None
-
-        self.output.append("\nELEMENT SELECTOR ACTIVATED")
-        self.output.append("=" * 100)
-        self.output.append("Click on any element in the browser to get its locators")
-        self.output.append("The selected element will be highlighted in blue")
-        self.output.append("=" * 100 + "\n")
 
         js_code = """
         if (window.elementSelectorActive) {
@@ -1539,22 +1849,31 @@ class EnterpriseDashboard(QMainWindow):
         }
 
         window.elementSelectorActive = true;
-        let selectedElement = null;
-        let originalStyle = null;
+        window.elementSelectorState = window.elementSelectorState || {
+            selectedElement: null,
+            originalStyle: null
+        };
+        window.clearElementSelectorHighlight = function() {
+            const state = window.elementSelectorState;
+            if (state.selectedElement && state.originalStyle) {
+                state.selectedElement.style.outline = state.originalStyle.outline;
+                state.selectedElement.style.outlineOffset = state.originalStyle.outlineOffset;
+                state.selectedElement.style.backgroundColor = state.originalStyle.backgroundColor;
+            }
+            state.selectedElement = null;
+            state.originalStyle = null;
+        };
+        window.clearElementSelectorHighlight();
 
         window.highlightElement = function(e) {
             e.preventDefault();
             e.stopPropagation();
 
-            if (selectedElement && originalStyle) {
-                selectedElement.style.outline = originalStyle.outline;
-                selectedElement.style.outlineOffset = originalStyle.outlineOffset;
-                selectedElement.style.backgroundColor = originalStyle.backgroundColor;
-            }
+            window.clearElementSelectorHighlight();
 
             const target = e.target;
             if (target !== document && target !== document.body && target !== document.documentElement) {
-                originalStyle = {
+                window.elementSelectorState.originalStyle = {
                     outline: target.style.outline,
                     outlineOffset: target.style.outlineOffset,
                     backgroundColor: target.style.backgroundColor
@@ -1562,7 +1881,7 @@ class EnterpriseDashboard(QMainWindow):
                 target.style.outline = '3px solid blue';
                 target.style.outlineOffset = '2px';
                 target.style.backgroundColor = 'rgba(0, 0, 255, 0.1)';
-                selectedElement = target;
+                window.elementSelectorState.selectedElement = target;
             }
         };
 
@@ -1618,43 +1937,23 @@ class EnterpriseDashboard(QMainWindow):
         document.addEventListener('mouseover', window.highlightElement, true);
         document.addEventListener('click', window.captureElement, true);
         """
-
-        try:
-            injected_count = 0
-            try:
-                frame_paths = self._collect_frame_paths()
-            except Exception:
-                frame_paths = [[]]
-
-            for frame_path in frame_paths:
-                try:
-                    self._switch_to_frame_path(frame_path)
-                    self.driver.execute_script(js_code)
-                    injected_count += 1
-                except Exception:
-                    continue
-                finally:
-                    self.driver.switch_to.default_content()
-
-            self.output.append(f"Element selector ready in {injected_count} document context(s). Click on an element in the browser...")
-            self._start_element_selection_polling()
-        except Exception as e:
-            self.output.append(f"Failed to enable selector: {str(e)}")
+        self._begin_selection_mode(
+            "single",
+            js_code,
+            [
+                "\nELEMENT SELECTOR ACTIVATED",
+                "=" * 100,
+                "Click on any element in the browser to get its locators",
+                "The selected element will be highlighted in blue",
+                "=" * 100 + "\n",
+            ],
+            "Element selector ready in {injected_count} document context(s). Click on an element in the browser...",
+        )
 
     def enable_relative_xpath_selection(self):
         """Enable selecting a dynamic target followed by a stable reference element."""
         if not self.ensure_driver():
             return
-
-        self.selection_mode = "relative"
-        self.relative_selection_progress = None
-
-        self.output.append("\nRELATIVE XPATH SELECTOR ACTIVATED")
-        self.output.append("=" * 100)
-        self.output.append("Step 1: Click the dynamic target element.")
-        self.output.append("Step 2: Click the stable reference element.")
-        self.output.append("Relative XPath options will be generated from the second element back to the first.")
-        self.output.append("=" * 100 + "\n")
 
         js_code = """
         if (window.relativeXPathSelectionActive) {
@@ -1666,8 +1965,10 @@ class EnterpriseDashboard(QMainWindow):
         window.relativeSelectionStage = 'target';
         window.relativeSelectionData = null;
         window.relativeSelectedTarget = null;
-        let highlightedElement = null;
-        let highlightedOriginalStyle = null;
+        window.relativeSelectorState = window.relativeSelectorState || {
+            highlightedElement: null,
+            highlightedOriginalStyle: null
+        };
 
         function cleanText(value) {
             return (value || '').replace(/\\s+/g, ' ').trim();
@@ -1849,24 +2150,26 @@ class EnterpriseDashboard(QMainWindow):
             return relationship;
         }
 
-        function clearHighlight() {
-            if (highlightedElement && highlightedOriginalStyle) {
-                highlightedElement.style.outline = highlightedOriginalStyle.outline;
-                highlightedElement.style.outlineOffset = highlightedOriginalStyle.outlineOffset;
-                highlightedElement.style.backgroundColor = highlightedOriginalStyle.backgroundColor;
+        window.clearRelativeXPathHighlight = function() {
+            const state = window.relativeSelectorState;
+            if (state.highlightedElement && state.highlightedOriginalStyle) {
+                state.highlightedElement.style.outline = state.highlightedOriginalStyle.outline;
+                state.highlightedElement.style.outlineOffset = state.highlightedOriginalStyle.outlineOffset;
+                state.highlightedElement.style.backgroundColor = state.highlightedOriginalStyle.backgroundColor;
             }
-            highlightedElement = null;
-            highlightedOriginalStyle = null;
-        }
+            state.highlightedElement = null;
+            state.highlightedOriginalStyle = null;
+        };
+        window.clearRelativeXPathHighlight();
 
         window.relativeHighlightElement = function(e) {
             e.preventDefault();
             e.stopPropagation();
-            clearHighlight();
+            window.clearRelativeXPathHighlight();
 
             const target = e.target;
             if (target !== document && target !== document.body && target !== document.documentElement) {
-                highlightedOriginalStyle = {
+                window.relativeSelectorState.highlightedOriginalStyle = {
                     outline: target.style.outline,
                     outlineOffset: target.style.outlineOffset,
                     backgroundColor: target.style.backgroundColor
@@ -1875,7 +2178,7 @@ class EnterpriseDashboard(QMainWindow):
                 target.style.outline = isTargetStage ? '3px solid #dc2626' : '3px solid #16a34a';
                 target.style.outlineOffset = '2px';
                 target.style.backgroundColor = isTargetStage ? 'rgba(220, 38, 38, 0.12)' : 'rgba(22, 163, 74, 0.12)';
-                highlightedElement = target;
+                window.relativeSelectorState.highlightedElement = target;
             }
         };
 
@@ -1908,41 +2211,32 @@ class EnterpriseDashboard(QMainWindow):
                 document.removeEventListener('mouseover', window.relativeHighlightElement, true);
                 document.removeEventListener('click', window.captureRelativeElement, true);
                 window.relativeXPathSelectionActive = false;
-                clearHighlight();
+                window.clearRelativeXPathHighlight();
             }
         };
 
         document.addEventListener('mouseover', window.relativeHighlightElement, true);
-        document.addEventListener('click', window.captureRelativeElement, true);
+       document.addEventListener('click', window.captureRelativeElement, true);
         """
-
-        try:
-            injected_count = 0
-            try:
-                frame_paths = self._collect_frame_paths()
-            except Exception:
-                frame_paths = [[]]
-
-            for frame_path in frame_paths:
-                try:
-                    self._switch_to_frame_path(frame_path)
-                    self.driver.execute_script(js_code)
-                    injected_count += 1
-                except Exception:
-                    continue
-                finally:
-                    self.driver.switch_to.default_content()
-
-            self.test_result_display.setText(
+        self._begin_selection_mode(
+            "relative",
+            js_code,
+            [
+                "\nRELATIVE XPATH SELECTOR ACTIVATED",
+                "=" * 100,
+                "Step 1: Click the dynamic target element.",
+                "Step 2: Click the stable reference element.",
+                "Relative XPath options will be generated from the second element back to the first.",
+                "=" * 100 + "\n",
+            ],
+            "Relative XPath selector ready in {injected_count} document context(s).",
+            tester_message=(
                 "Relative XPath selection started.\n\n"
                 "1. Click the dynamic target element.\n"
                 "2. Click the stable reference element.\n"
-                "Relative XPath options will appear here."
-            )
-            self.output.append(f"Relative XPath selector ready in {injected_count} document context(s).")
-            self._start_element_selection_polling()
-        except Exception as e:
-            self.output.append(f"Failed to enable relative selector: {str(e)}")
+                "Relative XPath options will appear in Output."
+            ),
+        )
 
     def _start_element_selection_polling(self):
         """Poll the browser for the active selector mode."""
@@ -2048,6 +2342,7 @@ class EnterpriseDashboard(QMainWindow):
 
     def _apply_selected_element_data(self, element_data, selected_frame_path):
         """Render the clicked element details and push the primary XPath into the tester."""
+        frame_label = self._format_frame_path(selected_frame_path)
         self.bg_color_toggle = not self.bg_color_toggle
         bg_marker = "[A]" if self.bg_color_toggle else "[B]"
 
@@ -2073,16 +2368,16 @@ class EnterpriseDashboard(QMainWindow):
             self.output.append(f"  Href: {element_data['href']}")
         if element_data.get('title'):
             self.output.append(f"  Title: {element_data['title']}")
-        self.output.append(f"  Frame: {self._format_frame_path(selected_frame_path)}")
+        self.output.append(f"  Frame: {frame_label}")
 
         self.output.append("\nLOCATOR OPTIONS:")
-        self._append_locator_rows_table(self._build_selected_element_locator_rows(element_data))
+        self._append_locator_rows_table(self._build_selected_element_locator_rows(element_data, frame_label=frame_label))
 
         if element_data.get('xpath'):
             self.test_locator_input.setText(element_data['xpath'])
             self.locator_type_combo.setCurrentText("XPath")
             self.test_result_display.setText(
-                f"Selected element loaded into Locator Tester.\n\nXPath: {element_data['xpath']}\nFrame: {self._format_frame_path(selected_frame_path)}"
+                f"Selected element loaded into Locator Tester.\n\nXPath: {element_data['xpath']}\nFrame: {frame_label}"
             )
             if hasattr(self, 'workspace_tabs') and hasattr(self, 'tester_tab_index'):
                 self.workspace_tabs.setCurrentIndex(self.tester_tab_index)
@@ -2091,19 +2386,20 @@ class EnterpriseDashboard(QMainWindow):
         self.output.append("Element was captured directly and loaded into the Locator Tester")
         self.cleanup_element_selector()
 
-    def _collect_xpath_locator_values(self, element_data, context=None):
+    def _collect_xpath_locator_values(self, element_data, context=None, frame_label='-'):
         """Return XPath-only locator candidates for a selected anchor element."""
         rows = []
         seen = set()
 
-        for row in self._build_selected_element_locator_rows(element_data or {}):
+        for row in self._build_selected_element_locator_rows(element_data or {}, frame_label=frame_label):
             locator_type = row.get("type") or ""
             locator_value = row.get("value") or ""
             if locator_value.startswith("//") or locator_value.startswith("("):
-                self._add_locator_row(rows, seen, locator_type, locator_value)
+                self._add_locator_row(rows, seen, locator_type, locator_value, row.get("frame"))
 
         for option in self._get_verified_stable_xpath_options(context or {}):
-            self._add_locator_row(rows, seen, option.get("type"), option.get("value"))
+            option_frame_label = self._format_frame_path(option.get("frame_path") or [])
+            self._add_locator_row(rows, seen, option.get("type"), option.get("value"), option_frame_label)
 
         return rows
 
@@ -2213,6 +2509,7 @@ class EnterpriseDashboard(QMainWindow):
         anchor_data = relative_data.get("anchor") or {}
         target_data = relative_data.get("target") or {}
         relationship = relative_data.get("relationship") or {}
+        frame_label = self._format_frame_path(selected_frame_path or [])
 
         if not anchor_data.get("xpath") or not target_data.get("xpath"):
             self.test_result_display.setText("Relative XPath selection did not capture enough element data.")
@@ -2246,7 +2543,7 @@ class EnterpriseDashboard(QMainWindow):
             "SUCCESS - Relative XPath selection completed.",
             f"Target Tag: <{target_data.get('tag', '')}>",
             f"Reference Tag: <{anchor_data.get('tag', '')}>",
-            f"Frame: {self._format_frame_path(selected_frame_path or [])}",
+            f"Frame: {frame_label}",
         ]
         if target_data.get("text"):
             info_lines.append(f"Target Text: {target_data['text'][:60]}")
@@ -2254,18 +2551,30 @@ class EnterpriseDashboard(QMainWindow):
             info_lines.append(f"Reference Text: {anchor_data['text'][:60]}")
         info_lines.append(f"Verified Relative XPath Count: {len(verified_rows)}")
 
-        locator_rows = []
-        seen = set()
-        for row in verified_rows or candidate_rows:
-            self._add_locator_row(locator_rows, seen, row.get("type"), row.get("value"))
+        verified_locator_rows = []
+        verified_seen = set()
+        for row in verified_rows:
+            self._add_locator_row(verified_locator_rows, verified_seen, row.get("type"), row.get("value"), frame_label)
 
-        if locator_rows:
-            self.test_locator_input.setText(locator_rows[0]["value"])
+        candidate_locator_rows = []
+        candidate_seen = set()
+        for row in candidate_rows:
+            self._add_locator_row(candidate_locator_rows, candidate_seen, row.get("type"), row.get("value"), frame_label)
+
+        primary_rows = verified_locator_rows or candidate_locator_rows
+        if primary_rows:
+            self.test_locator_input.setText(primary_rows[0]["value"])
             self.locator_type_combo.setCurrentText("XPath")
 
-        self._render_tester_locator_results_html("Relative XPath builder", attempt_logs, info_lines, locator_rows)
-        if hasattr(self, "workspace_tabs") and hasattr(self, "tester_tab_index"):
-            self.workspace_tabs.setCurrentIndex(self.tester_tab_index)
+        self._render_output_locator_sections_html(
+            "Relative XPath builder",
+            attempt_logs,
+            info_lines,
+            [
+                {"title": "Verified Relative XPath", "rows": verified_locator_rows},
+                {"title": "Candidate Relative XPath", "rows": candidate_locator_rows},
+            ],
+        )
         self.cleanup_element_selector()
 
     def show_element_selector_dialog(self):
@@ -2346,10 +2655,11 @@ class EnterpriseDashboard(QMainWindow):
                 self.output.append(f"  Href: {element_data['href']}")
             if element_data.get('title'):
                 self.output.append(f"  Title: {element_data['title']}")
-            self.output.append(f"  Frame: {self._format_frame_path(selected_frame_path)}")
+            frame_label = self._format_frame_path(selected_frame_path)
+            self.output.append(f"  Frame: {frame_label}")
 
             self.output.append("\nLOCATOR OPTIONS:")
-            self._append_locator_rows_table(self._build_selected_element_locator_rows(element_data))
+            self._append_locator_rows_table(self._build_selected_element_locator_rows(element_data, frame_label=frame_label))
 
             self.output.append("=" * 100)
             self.output.append("You can now copy any locator above to use in your tests")
@@ -2358,9 +2668,10 @@ class EnterpriseDashboard(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to capture element: {str(e)}")
             self.cleanup_element_selector()
 
-    def cancel_element_selection(self, dialog):
+    def cancel_element_selection(self, dialog=None):
         """Cancel element selection."""
-        dialog.close()
+        if dialog is not None:
+            dialog.close()
         self.cleanup_element_selector()
         self.output.append("Element selection cancelled")
 
@@ -2371,34 +2682,31 @@ class EnterpriseDashboard(QMainWindow):
                 self.selection_poll_timer.stop()
             self.selection_mode = None
             self.relative_selection_progress = None
+            self._set_selection_buttons_state(None)
             cleanup_js = """
             if (window.elementSelectorActive) {
                 document.removeEventListener('mouseover', window.highlightElement, true);
                 document.removeEventListener('click', window.captureElement, true);
+                if (window.clearElementSelectorHighlight) {
+                    window.clearElementSelectorHighlight();
+                }
                 window.elementSelectorActive = false;
                 window.selectedElementData = null;
             }
             if (window.relativeXPathSelectionActive || window.relativeSelectionData) {
                 document.removeEventListener('mouseover', window.relativeHighlightElement, true);
                 document.removeEventListener('click', window.captureRelativeElement, true);
+                if (window.clearRelativeXPathHighlight) {
+                    window.clearRelativeXPathHighlight();
+                }
                 window.relativeXPathSelectionActive = false;
                 window.relativeSelectionStage = null;
                 window.relativeSelectionData = null;
                 window.relativeSelectedTarget = null;
             }
             """
-            try:
-                frame_paths = self._collect_frame_paths()
-            except Exception:
-                frame_paths = [[]]
-            for frame_path in frame_paths:
-                try:
-                    self._switch_to_frame_path(frame_path)
-                    self.driver.execute_script(cleanup_js)
-                except Exception:
-                    continue
-                finally:
-                    self.driver.switch_to.default_content()
+            if self.driver:
+                self._run_script_in_selection_contexts(cleanup_js)
         except Exception:
             pass
 
@@ -2633,10 +2941,11 @@ class EnterpriseDashboard(QMainWindow):
         self._append_attempt_log(attempt_logs, "Element did not expose a value or visible text.")
         return "", snapshot
 
-    def _extract_table_context(self, element):
+    def _extract_table_context(self, element, element_is_table=False):
         """Extract the nearest table around the current element, if one exists."""
         script = """
         const element = arguments[0];
+        const elementIsTable = !!arguments[1];
 
         function stableClasses(node) {
             if (!node) return [];
@@ -2755,7 +3064,7 @@ class EnterpriseDashboard(QMainWindow):
             while (current && current.nodeType === 1) {
                 let scopedTables = [];
                 const tag = (current.tagName || '').toLowerCase();
-                if (tag === 'table') {
+                if (tag === 'table' || tag === 'grid' || current.getAttribute('role') === 'table' || current.getAttribute('role') === 'grid') {
                     scopedTables.push(current);
                 }
                 scopedTables = scopedTables.concat(Array.from(current.querySelectorAll('table, [role="table"], [role="grid"]')));
@@ -2774,6 +3083,9 @@ class EnterpriseDashboard(QMainWindow):
             const rows = reconstructRows(table);
             const tableText = getElementText(table);
             let score = 0;
+            if (table === element) {
+                score += 150;
+            }
             if (table.contains(element)) {
                 score += 100;
             }
@@ -2788,7 +3100,7 @@ class EnterpriseDashboard(QMainWindow):
         }
 
         const targetText = getElementText(element);
-        const candidateTables = getCandidateTables(element)
+        const candidateTables = (elementIsTable ? [element] : getCandidateTables(element))
             .map(table => scoreTable(table, targetText))
             .sort((a, b) => b.score - a.score);
 
@@ -2825,7 +3137,7 @@ class EnterpriseDashboard(QMainWindow):
             anchor_text: targetText
         };
         """
-        return self.driver.execute_script(script, element)
+        return self.driver.execute_script(script, element, element_is_table)
 
     def _table_context_to_dataframe(self, table_context):
         """Convert extracted table context into a pandas DataFrame."""
@@ -2902,21 +3214,21 @@ class EnterpriseDashboard(QMainWindow):
             filtered_rows.pop()
         return filtered_rows
 
-    def _build_table_locator_rows(self, table_context, dataframe):
+    def _build_table_locator_rows(self, table_context, dataframe, frame_label='-'):
         """Build structured locator rows for extracted table output."""
         rows = []
         seen = set()
-        self._add_locator_row(rows, seen, "Table XPath", table_context.get('xpath') or '')
-        self._add_locator_row(rows, seen, "Table Class XPath", table_context.get('class_xpath') or '')
-        self._add_locator_row(rows, seen, "Table ID", table_context.get('id') or '')
+        self._add_locator_row(rows, seen, "Table XPath", table_context.get('xpath') or '', frame_label)
+        self._add_locator_row(rows, seen, "Table Class XPath", table_context.get('class_xpath') or '', frame_label)
+        self._add_locator_row(rows, seen, "Table ID", table_context.get('id') or '', frame_label)
         classes = table_context.get('classes') or []
         if classes:
-            self._add_locator_row(rows, seen, "Table Class", "." + ".".join(classes))
+            self._add_locator_row(rows, seen, "Table Class", "." + ".".join(classes), frame_label)
         headers = [str(header).strip() for header in (table_context.get('headers') or []) if str(header).strip()]
         if headers:
-            self._add_locator_row(rows, seen, "Table Headers", " | ".join(headers[:10]))
-        self._add_locator_row(rows, seen, "Extracted Rows", str(dataframe.shape[0]))
-        self._add_locator_row(rows, seen, "Extracted Columns", str(dataframe.shape[1]))
+            self._add_locator_row(rows, seen, "Table Headers", " | ".join(headers[:10]), frame_label)
+        self._add_locator_row(rows, seen, "Extracted Rows", str(dataframe.shape[0]), frame_label)
+        self._add_locator_row(rows, seen, "Extracted Columns", str(dataframe.shape[1]), frame_label)
         return rows
 
     def _render_table_extraction_report(self, locator_value, frame_path, table_context, dataframe):
@@ -3426,10 +3738,11 @@ class EnterpriseDashboard(QMainWindow):
                 locator_type,
                 attempt_logs=attempt_logs
             )
+            frame_label = self._format_frame_path(frame_path or [])
 
             requested_locator_rows = []
             requested_seen = set()
-            self._add_locator_row(requested_locator_rows, requested_seen, locator_type, locator_value)
+            self._add_locator_row(requested_locator_rows, requested_seen, locator_type, locator_value, frame_label if element else "-")
 
             if element:
                 by_strategy = self.get_locator_strategy(strategy_used, strategy_value_used)
@@ -3461,7 +3774,7 @@ class EnterpriseDashboard(QMainWindow):
                     "SUCCESS - Element Found!",
                     f"Strategy Used: {strategy_used}",
                     f"Tag: <{snapshot.get('tag', '')}>",
-                    f"Frame: {self._format_frame_path(frame_path or [])}",
+                    f"Frame: {frame_label}",
                     f"Value/Text: {value or '(empty)'}",
                 ]
 
@@ -3494,16 +3807,17 @@ class EnterpriseDashboard(QMainWindow):
                 locator_rows = []
                 seen = set()
                 for row in requested_locator_rows:
-                    self._add_locator_row(locator_rows, seen, row.get("type"), row.get("value"))
+                    self._add_locator_row(locator_rows, seen, row.get("type"), row.get("value"), row.get("frame"))
                 if strategy_used != locator_type or strategy_value_used != locator_value:
-                    self._add_locator_row(locator_rows, seen, strategy_used, strategy_value_used)
-                for row in self._build_selected_element_locator_rows(snapshot or {}):
-                    self._add_locator_row(locator_rows, seen, row.get("type"), row.get("value"))
+                    self._add_locator_row(locator_rows, seen, strategy_used, strategy_value_used, frame_label)
+                for row in self._build_selected_element_locator_rows(snapshot or {}, frame_label=frame_label):
+                    self._add_locator_row(locator_rows, seen, row.get("type"), row.get("value"), row.get("frame"))
                 for option in verified_stable_options:
-                    self._add_locator_row(locator_rows, seen, option.get("type"), option.get("value"))
+                    option_frame_label = self._format_frame_path(option.get("frame_path") or [])
+                    self._add_locator_row(locator_rows, seen, option.get("type"), option.get("value"), option_frame_label)
                 for option in self._build_locator_result_options(context or {}):
                     locator_type_option, locator_value_option = option.split(": ", 1) if ": " in option else ("Locator", option)
-                    self._add_locator_row(locator_rows, seen, locator_type_option, locator_value_option)
+                    self._add_locator_row(locator_rows, seen, locator_type_option, locator_value_option, frame_label)
 
                 self._refresh_frame_downloads_for_match(frame_path, attempt_logs)
                 self._render_tester_locator_results_html("Locator test log", attempt_logs, info_lines, locator_rows)
@@ -3595,7 +3909,7 @@ class EnterpriseDashboard(QMainWindow):
                 f"Table Rows: {dataframe.shape[0]}",
                 f"Table Columns: {dataframe.shape[1]}",
             ]
-            locator_rows = self._build_table_locator_rows(table_context, dataframe)
+            locator_rows = self._build_table_locator_rows(table_context, dataframe, frame_label=self._format_frame_path(frame_path or []))
             self._refresh_frame_downloads_for_match(frame_path, attempt_logs)
             self._render_tester_locator_results_html("Table extraction log", attempt_logs, info_lines, locator_rows)
         finally:
